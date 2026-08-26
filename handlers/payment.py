@@ -37,6 +37,7 @@ from database import (
     set_pending_reminder,
     cancel_reminder,
     clear_plan_interest,
+    cancel_start_reminders,
 )
 from keyboards.menu import (
     payment_details_keyboard,
@@ -413,6 +414,8 @@ async def callback_buy(call: CallbackQuery, bot: Bot) -> None:
         return
 
     user = call.from_user
+
+    await cancel_start_reminders(user.id)
 
     # Block repurchase of an already-active plan (approved + not yet expired).
     if await user_has_active_plan(user.id, plan_id):

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 from datetime import datetime, timezone, timedelta
 
 from aiogram import Router, Bot
@@ -11,6 +12,9 @@ from database import (
     get_all_plans, get_plan, get_setting, get_start_demo,
     schedule_referral_reminder,
     save_plan_interest,
+    schedule_start_reminders,
+    cancel_start_reminders,
+    has_any_approved_order,
 )
 from keyboards.menu import plans_list_keyboard, plan_detail_keyboard, main_menu_keyboard
 from handlers.log_channel import log_new_user, log_plan_selected
@@ -198,6 +202,18 @@ async def cmd_start(message: Message, bot: Bot) -> None:
         await message.answer(welcome_text)
         await message.answer(NO_PLANS_TEXT)
         return
+    if not await has_any_approved_order(user.id):
+        try:
+            first_min = max(1, int((await get_setting("start_reminder_first_min", "15")) or 15))
+            first_max = max(first_min, int((await get_setting("start_reminder_first_max", "30")) or 30))
+            await schedule_start_reminders(
+                user.id,
+                datetime.now(timezone.utc) + timedelta(minutes=random.randint(first_min, first_max)),
+            )
+        except (TypeError, ValueError):
+            logger.exception("Invalid start reminder timing configuration")
+        except Exception:
+            logger.exception("Failed to schedule start reminders for user %s", user.id)
     welcome_text = (await get_setting("welcome_message")) or _DEFAULT_WELCOME
     await message.answer(welcome_text)
     await message.answer(
@@ -237,6 +253,8 @@ async def callback_plan(call: CallbackQuery, bot: Bot) -> None:
     if not plan:
         await call.message.answer("⚠️ Plan not found. It may have been removed.")
         return
+
+    await cancel_start_reminders(call.from_user.id)
 
     await log_plan_selected(
         bot,

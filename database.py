@@ -145,6 +145,14 @@ async def init_db() -> None:
         ("reminder_second_delay_min", "1440"),  # 24 hours
         ("reminder_first_message",   _DEFAULT_REMINDER_FIRST_MESSAGE),   # 15-minute reminder
         ("reminder_second_message",  _DEFAULT_REMINDER_SECOND_MESSAGE),  # 24-hour reminder
+        ("start_reminder_first_min", "15"),
+        ("start_reminder_first_max", "30"),
+        ("start_reminder_second_min", "120"),
+        ("start_reminder_second_max", "240"),
+        ("start_reminder_third_min", "720"),
+        ("start_reminder_third_max", "1440"),
+        ("start_reminder_fourth_min", "1440"),
+        ("start_reminder_fourth_max", "2880"),
         ("referral_enabled",         "1"),   # referral system on by default
         ("referral_reward_pct",      "5"),   # discount % awarded per referral
         ("max_referral_discount",    "100"), # maximum total discount a user can earn
@@ -243,6 +251,10 @@ async def save_user(user_id: int, username: str | None, first_name: str) -> bool
                 "plan_interest_plan_id":     None,
                 "plan_interest_due_at":      None,
                 "plan_interest_sent":        False,
+                "start_reminder_initialized": False,
+                "start_reminder_cancelled":   False,
+                "start_reminder_step":        0,
+                "start_reminder_due_at":      None,
             },
         },
         upsert=True,
@@ -306,6 +318,71 @@ async def clear_plan_interest(user_id: int) -> None:
     await _users.update_one(
         {"_id": user_id},
         {"$set": {"plan_interest_sent": True}},
+    )
+
+
+async def schedule_start_reminders(user_id: int, due_at: datetime) -> bool:
+    """Create the first follow-up schedule once for a user who has not selected a plan."""
+    result = await _users.update_one(
+        {
+            "_id": user_id,
+            "start_reminder_initialized": {"$ne": True},
+            "start_reminder_cancelled": {"$ne": True},
+            "plan_interest_plan_id": None,
+        },
+        {"$set": {
+            "start_reminder_initialized": True,
+            "start_reminder_step": 0,
+            "start_reminder_due_at": due_at,
+        }},
+    )
+    return result.modified_count == 1
+
+
+async def get_due_start_reminders(now: datetime) -> list[dict]:
+    """Return pending start follow-up reminders that are due."""
+    cursor = _users.find(
+        {
+            "start_reminder_initialized": True,
+            "start_reminder_cancelled": {"$ne": True},
+            "start_reminder_due_at": {"$ne": None, "$lte": now},
+            "start_reminder_step": {"$lt": 4},
+        },
+        {"_id": 1, "start_reminder_step": 1},
+    )
+    return [
+        {"user_id": doc["_id"], "step": doc.get("start_reminder_step", 0)}
+        async for doc in cursor
+    ]
+
+
+async def advance_start_reminder(user_id: int, step: int, due_at: datetime | None) -> bool:
+    """Claim one reminder step and persist its next due time, if still current."""
+    update = {"$set": {
+        "start_reminder_step": step + 1,
+        "start_reminder_due_at": due_at,
+    }}
+    if due_at is None:
+        update["$set"]["start_reminder_cancelled"] = True
+    result = await _users.update_one(
+        {
+            "_id": user_id,
+            "start_reminder_cancelled": {"$ne": True},
+            "start_reminder_step": step,
+        },
+        update,
+    )
+    return result.modified_count == 1
+
+
+async def cancel_start_reminders(user_id: int) -> None:
+    """Permanently cancel all remaining start follow-up reminders."""
+    await _users.update_one(
+        {"_id": user_id, "start_reminder_cancelled": {"$ne": True}},
+        {"$set": {
+            "start_reminder_cancelled": True,
+            "start_reminder_due_at": None,
+        }},
     )
 
 

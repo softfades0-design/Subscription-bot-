@@ -16,7 +16,8 @@ returns on its own.
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+import random
+from datetime import datetime, timezone, timedelta
 
 from aiogram import Bot
 
@@ -32,8 +33,13 @@ from database import (
     get_due_plan_interest_reminders,
     mark_plan_interest_sent,
     user_has_active_plan,
+    get_due_start_reminders,
+    advance_start_reminder,
+    cancel_start_reminders,
+    get_all_plans,
 )
 from keyboards.menu import reminder_buy_now_keyboard, referral_reminder_keyboard, plan_interest_reminder_keyboard
+from keyboards.menu import plans_list_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +59,12 @@ _DEFAULT_REMINDER_SECOND_MESSAGE = (
     "💰 <b>Price:</b> ₹{plan_price}\n"
     "⏳ <b>Validity:</b> {plan_validity}\n\n"
     "Tap <b>Buy Now</b> below before this offer slips away!"
+)
+
+_START_REMINDER_RANGES = (
+    ("start_reminder_second_min", "start_reminder_second_max", 120, 240),
+    ("start_reminder_third_min", "start_reminder_third_max", 720, 1440),
+    ("start_reminder_fourth_min", "start_reminder_fourth_max", 1440, 2880),
 )
 
 
@@ -166,3 +178,36 @@ async def _tick(bot: Bot) -> None:
             logger.warning("Failed to send plan-interest reminder to user %s", user_id)
         # Mark sent regardless of delivery outcome — never retry this reminder.
         await mark_plan_interest_sent(user_id)
+
+    # Start follow-up reminders for users who have not selected a plan.
+    for item in await get_due_start_reminders(now):
+        user_id = item["user_id"]
+        step = item["step"]
+        if await has_any_approved_order(user_id):
+            await cancel_start_reminders(user_id)
+            continue
+
+        plans = await get_all_plans()
+        if not plans:
+            continue
+
+        next_due = None
+        if step < len(_START_REMINDER_RANGES):
+            min_key, max_key, default_min, default_max = _START_REMINDER_RANGES[step]
+            try:
+                delay_min = max(1, int((await get_setting(min_key, str(default_min))) or default_min))
+                delay_max = max(delay_min, int((await get_setting(max_key, str(default_max))) or default_max))
+            except (TypeError, ValueError):
+                delay_min, delay_max = default_min, default_max
+            next_due = now + timedelta(minutes=random.randint(delay_min, delay_max))
+
+        if not await advance_start_reminder(user_id, step, next_due):
+            continue
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text="✨ Choose a plan below to continue 👇",
+                reply_markup=plans_list_keyboard(plans),
+            )
+        except Exception:
+            logger.warning("Failed to send start follow-up reminder to user %s", user_id)
