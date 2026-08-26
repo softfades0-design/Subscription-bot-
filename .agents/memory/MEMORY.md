@@ -1,2 +1,4 @@
 - [Telegram bot conflict debugging](telegram-bot-polling-conflicts.md) — TelegramConflictError from a duplicate poller (e.g. old Render deploy) mimics in-app data/state bugs; check for it before assuming code regressions.
 - [MongoDB order-approval race](mongo-atomic-order-approval.md) — always use find_one_and_update (not find_one + update_one) for state-transition writes gated on a status field.
+- [User-keyed schedule races](reminder-schedule-user-keyed-races.md) — scope cancel/mark ops on a "replace, don't duplicate" per-user record by (user_id, order_id), not user_id alone.
+- [Python dependency environment](python-dependency-environment.md) — requirements can list Flask while the Replit Python environment still lacks it; install the declared package before debugging app code.

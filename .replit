@@ -36,5 +36,3 @@ externalPort = 80
 
 [userenv.shared]
 SOURCE_CHANNEL_ID = "-1004483132545"
-QR_IMAGE_URL = "https://i.ibb.co/dsc6Qxmm/IMG-20260705-WA0000.jpg"
-MONGODB_URI = "mongodb+srv://bobby2606:bobby2606@bobby2606.d1sumy8.mongodb.net/?appName=Bobby2606"

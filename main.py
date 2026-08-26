@@ -16,8 +16,12 @@ from handlers import start
 from handlers import payment
 from handlers import admin
 from handlers import settings as settings_handler
+import reminder_scheduler
 
 logging.basicConfig(level=logging.INFO)
+
+_startup_logger = logging.getLogger(__name__)
+_startup_logger.info("RUNNING NEW BUILD")
 
 # ── Flask health-check server ─────────────────────────────────────────────────
 
@@ -40,6 +44,7 @@ BOT_COMMANDS = [
     BotCommand(command="start",   description="Start the bot"),
     BotCommand(command="plans",   description="View available plans"),
     BotCommand(command="status",  description="Check your subscription status"),
+    BotCommand(command="refer",   description="👥 Refer & Earn"),
     BotCommand(command="help",    description="Help & usage guide"),
     BotCommand(command="contact", description="Contact support"),
     BotCommand(command="admin",   description="Admin panel (admins only)"),
@@ -67,6 +72,8 @@ async def main() -> None:
     dp.include_router(start.router)
 
     await bot.set_my_commands(BOT_COMMANDS)
+
+    asyncio.create_task(reminder_scheduler.run(bot))
 
     await dp.start_polling(bot)
 

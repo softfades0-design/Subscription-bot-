@@ -10,16 +10,10 @@ if not BOT_TOKEN:
 
 SOURCE_CHANNEL_ID: str = os.getenv("SOURCE_CHANNEL_ID", "-1004483132545")
 
-# Set this to your UPI QR code image URL to show it in the payment screen.
-QR_IMAGE_URL: str = os.getenv("QR_IMAGE_URL", "")
-
-SUPPORT_GROUP_URL: str = os.getenv("SUPPORT_GROUP_URL", "https://t.me/+i7Ox197t4205MTQ1")
+SUPPORT_GROUP_URL: str = os.getenv("SUPPORT_GROUP_URL", "https://t.me/+a0bn6M0FzXUxNmY9")
 
 # Channel where new-user and activity events are logged.
 LOG_CHANNEL_ID: int = int(os.getenv("LOG_CHANNEL_ID", "-1003923230922"))
-
-# Channel where payment screenshots / UTRs are forwarded for admin review.
-PAYMENT_REVIEW_CHANNEL_ID: int = int(os.getenv("PAYMENT_REVIEW_CHANNEL_ID", "-1003290863151"))
 
 # Comma-separated list of Telegram user IDs that can access /admin.
 # Example: ADMIN_IDS=123456789,987654321
@@ -34,3 +28,7 @@ if not ADMIN_IDS:
         "Set it to a comma-separated list of Telegram user IDs that should have admin access.\n"
         "Example: ADMIN_IDS=123456789,987654321"
     )
+
+# VC Store payment verification API
+VC_API_KEY: str = os.getenv("VC_API_KEY", "")
+VC_API_URL: str = os.getenv("VC_API_URL", "https://vcapi.vcstore.site/payment_api.php")

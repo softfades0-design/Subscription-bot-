@@ -70,3 +70,44 @@ async def log_payment_started(
         f"🆔 User ID: <code>{user_id}</code>\n"
         f"📦 Plan: {html.escape(plan_title)}",
     )
+
+
+async def log_payment_success(
+    bot: Bot,
+    user_id: int,
+    first_name: str,
+    plan_name: str = "",
+    amount: str = "",
+    order_id: str = "",
+) -> None:
+    await _send(
+        bot,
+        "🎉 <b>Payment Successful</b>\n\n"
+        f"👤 User: {html.escape(first_name)}\n"
+        f"🆔 User ID: <code>{user_id}</code>\n"
+        f"📦 Plan: {html.escape(plan_name)}\n"
+        f"💰 Amount: ₹{html.escape(amount)}\n"
+        f"🆔 Order: <code>{html.escape(order_id)}</code>\n\n"
+        "✅ Subscription Activated",
+    )
+
+
+async def log_payment_failed(
+    bot: Bot,
+    user_id: int,
+    first_name: str,
+    plan_name: str = "",
+    amount: str = "",
+    order_id: str = "",
+    reason: str = "",
+) -> None:
+    await _send(
+        bot,
+        "❌ <b>Payment Failed</b>\n\n"
+        f"👤 User: {html.escape(first_name)}\n"
+        f"🆔 User ID: <code>{user_id}</code>\n"
+        f"📦 Plan: {html.escape(plan_name)}\n"
+        f"💰 Amount: ₹{html.escape(amount)}\n"
+        f"🆔 Order: <code>{html.escape(order_id)}</code>\n\n"
+        f"Reason: {html.escape(reason)}",
+    )
