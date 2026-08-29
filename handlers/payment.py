@@ -42,6 +42,13 @@ from config import (
     PURPOSE_PREFIX,
     BRAND_NAME,
     ORDER_EXPIRY_MINUTES,
+    GMAIL_LOOKBACK_HOURS,
+    IMAP_HOST,
+    IMAP_PORT,
+    IMAP_USERNAME,
+    IMAP_APP_PASSWORD,
+    IMAP_MAILBOX,
+    IMAP_SENDER_FILTER,
 )
 from database import (
     create_order,
