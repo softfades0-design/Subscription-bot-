@@ -800,12 +800,20 @@ async def create_order(
     access_link: str = "",
     final_price: str = "",
     referral_discount_used: int = 0,
+    payment_purpose: str | None = None,
+    upi_uri: str | None = None,
+    payee_name: str | None = None,
+    qr_image: bytes | None = None,
+    expires_at: datetime | None = None,
 ) -> None:
     """Insert a new order row with status 'created'.
 
     ``referral_discount_used`` records the discount percentage (0–100) that
-    was applied to this order.  A non-zero value causes the referral discount
+    was applied to this order. A non-zero value causes the referral discount
     to be consumed when the order is approved.
+
+    Additional FamApp metadata is stored only when the automatic provider is
+    creating a payment order; existing manual/payment logic remains unchanged.
     """
     try:
         await _orders.insert_one({
@@ -822,6 +830,11 @@ async def create_order(
             "plan_id":                plan_id,
             "access_link":            access_link,
             "referral_discount_used": referral_discount_used,
+            "payment_purpose":        payment_purpose,
+            "upi_uri":               upi_uri,
+            "payee_name":            payee_name,
+            "qr_image":              qr_image,
+            "expires_at":            expires_at,
         })
     except Exception as exc:
         # Preserve the SQLite-era "UNIQUE" signal so callers retrying on
@@ -835,15 +848,6 @@ async def create_order(
 async def update_order_status(order_id: str, status: str) -> None:
     await _orders.update_one({"_id": order_id}, {"$set": {"payment_status": status}})
     logger.debug("Order %s → %s", order_id, status)
-
-
-async def save_order_transaction_id(order_id: str, transaction_id: str) -> None:
-    """Persist the VC-assigned transaction_id on the order document."""
-    await _orders.update_one(
-        {"_id": order_id},
-        {"$set": {"transaction_id": transaction_id}},
-    )
-    logger.debug("Order %s — transaction_id saved: %s", order_id, transaction_id)
 
 
 async def approve_order(order_id: str) -> dict | None:

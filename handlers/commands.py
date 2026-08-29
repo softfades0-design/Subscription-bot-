@@ -26,14 +26,10 @@ _STARTUP_TIME = datetime.now(timezone.utc)
 async def cmd_debug(message: Message) -> None:
     logger.info("/debug from user %s", message.from_user.id)
     uptime_str = _STARTUP_TIME.strftime("%Y-%m-%d %H:%M:%S UTC")
-    vc_key_loaded  = "✅ Yes" if os.environ.get("VC_API_KEY")  else "❌ No"
-    vc_url_loaded  = "✅ Yes" if os.environ.get("VC_API_URL")  else "❌ No"
     await message.answer(
         "<b>🔧 Debug Info</b>\n\n"
         f"<b>Build version:</b> <code>{BUILD_VERSION}</code>\n"
-        f"<b>Startup time:</b> <code>{uptime_str}</code>\n"
-        f"<b>VC_API_KEY loaded:</b> {vc_key_loaded}\n"
-        f"<b>VC_API_URL loaded:</b> {vc_url_loaded}"
+        f"<b>Startup time:</b> <code>{uptime_str}</code>"
     )
 
 

@@ -1,28 +1,48 @@
 """
-handlers/payment.py — Buy Now flow with automatic VC Store payment verification.
+handlers/payment.py — Buy Now flow with automatic FamApp payment verification.
 
 Sequence:
   1. callback_buy         → load plan from DB, generate order, show payment details
-  2. callback_i_have_paid → call VC Store API to verify payment automatically
-       success  → instantly approve order, send access link
-       pending  → tell user payment is still being processed
-       failed   → ask user to complete payment and try again
-  3. cancel callbacks     → cancel order, return to main menu
+  2. callback_i_have_paid → verify the FamApp payment automatically via IMAP
+       success  → approve the order and send access link
+       pending  → tell the user the payment is still being processed
+       failed   → ask the user to complete payment and try again
+  3. cancel callbacks     → cancel the order and return to the main menu
 """
 
+import email
 import html
+import imaplib
 import logging
+import os
 import random
+import re
+import secrets
+import string
 import time
 import urllib.parse
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation
+from email import policy
+from email.utils import parsedate_to_datetime
+from io import BytesIO
 
-import aiohttp
+import qrcode
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from qrcode.constants import ERROR_CORRECT_H
 
 from aiogram import Router, Bot, F
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, BufferedInputFile
 
-from config import VC_API_KEY, VC_API_URL, LOG_CHANNEL_ID, ADMIN_IDS
+from config import (
+    LOG_CHANNEL_ID,
+    ADMIN_IDS,
+    DEFAULT_UPI_ID,
+    DEFAULT_PAYEE_NAME,
+    PURPOSE_PREFIX,
+    BRAND_NAME,
+    ORDER_EXPIRY_MINUTES,
+)
 from database import (
     create_order,
     update_order_status,
@@ -70,63 +90,274 @@ def _make_order_id() -> str:
     return f"ORD{int(time.time())}"
 
 
-def _make_upi_qr_url(order_id: str, amount: str) -> str:
-    """Build a quickchart.io QR image URL that encodes the UPI payment URI."""
-    upi_uri = (
-        f"upi://pay?pa=paytm.s1dw5n0@pty"
-        f"&pn=VC+Payment+Gateway"
-        f"&tid={order_id}"
-        f"&tr={order_id}"
-        f"&tn=VC+Payment"
-        f"&am={amount}"
-        f"&cu=INR"
-    )
-    encoded = urllib.parse.quote(upi_uri, safe="")
-    return f"https://quickchart.io/qr?text={encoded}&size=1000&ecLevel=H&format=png&margin=2"
+def _format_amount(amount: str | Decimal) -> str:
+    value = Decimal(str(amount))
+    normalized = value.normalize()
+    text = format(normalized, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _generate_famapp_purpose() -> str:
+    prefix = "".join(ch for ch in str(PURPOSE_PREFIX or "FAP").upper() if ch.isalnum()) or "FAP"
+    date_part = datetime.now(timezone.utc).strftime("%Y%m%d")
+    suffix = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
+    return f"{prefix}-{date_part}-{suffix}"
+
+
+def _build_famapp_upi_uri(amount: str | Decimal, purpose: str) -> str:
+    params = {
+        "pa": DEFAULT_UPI_ID,
+        "pn": DEFAULT_PAYEE_NAME,
+        "am": _format_amount(amount),
+        "cu": "INR",
+        "tn": purpose,
+    }
+    return "upi://pay?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+
+
+def _load_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    font_candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ]
+    for path in font_candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size=size)
+            except OSError:
+                continue
+    return ImageFont.load_default()
+
+
+def _text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> tuple[int, int]:
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
+def _draw_centered_text(draw: ImageDraw.ImageDraw, x_center: int, y: int, text: str, font: ImageFont.ImageFont, fill: str = "#111111") -> int:
+    text_width, text_height = _text_size(draw, text, font)
+    x = x_center - text_width // 2
+    draw.text((x, y), text, font=font, fill=fill)
+    return text_height
+
+
+def _draw_badge(draw: ImageDraw.ImageDraw, x: int, y: int, width: int, height: int, text: str, font: ImageFont.ImageFont) -> None:
+    draw.rounded_rectangle((x, y, x + width, y + height), radius=height // 2, fill="#EAF2FF", outline="#C9DAFF", width=2)
+    text_width, text_height = _text_size(draw, text, font)
+    draw.text((x + (width - text_width) // 2, y + (height - text_height) // 2 - 2), text, font=font, fill="#1849A9")
+
+
+def _generate_famapp_qr_bytes(amount: str | Decimal, purpose: str) -> bytes:
+    upi_uri = _build_famapp_upi_uri(amount, purpose)
+    qr = qrcode.QRCode(version=None, error_correction=ERROR_CORRECT_H, box_size=14, border=4)
+    qr.add_data(upi_uri)
+    qr.make(fit=True)
+    qr_image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+
+    canvas = Image.new("RGB", (1400, 1700), "#F6F8FC")
+    shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    shadow_draw = ImageDraw.Draw(shadow)
+    shadow_draw.rounded_rectangle((110, 80, 1290, 1620), radius=54, fill=(0, 0, 0, 74))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(28))
+    canvas.paste(shadow.convert("RGB"), (0, 0), shadow)
+
+    draw = ImageDraw.Draw(canvas)
+    draw.rounded_rectangle((90, 60, 1310, 1600), radius=54, fill="white", outline="#E3EAF6", width=3)
+    draw.rounded_rectangle((90, 60, 1310, 220), radius=54, fill="#0F4C81")
+    draw.rectangle((90, 150, 1310, 220), fill="#0F4C81")
+
+    brand_font = _load_font(56, bold=True)
+    subtitle_font = _load_font(24, bold=False)
+    title_font = _load_font(34, bold=True)
+    body_font = _load_font(30, bold=False)
+    label_font = _load_font(24, bold=True)
+    small_font = _load_font(22, bold=False)
+
+    initials = "".join(part[0] for part in BRAND_NAME.split() if part)[:3].upper() or "FAP"
+    _draw_badge(draw, 120, 92, 92, 56, initials, _load_font(24, bold=True))
+    _draw_centered_text(draw, 700, 88, BRAND_NAME, brand_font, fill="white")
+    _draw_centered_text(draw, 700, 156, "Secure UPI Payment", subtitle_font, fill="#D9E8F7")
+
+    qr_box = (290, 290, 1110, 1110)
+    draw.rounded_rectangle(qr_box, radius=40, fill="white", outline="#DCE6F4", width=4)
+    qr_size = 720
+    qr_image = qr_image.resize((qr_size, qr_size), Image.Resampling.LANCZOS)
+    qr_x = qr_box[0] + (qr_box[2] - qr_box[0] - qr_size) // 2
+    qr_y = qr_box[1] + (qr_box[3] - qr_box[1] - qr_size) // 2
+    canvas.paste(qr_image, (qr_x, qr_y))
+
+    _draw_centered_text(draw, 700, 1160, "Scan to Pay", title_font, fill="#102A43")
+    _draw_centered_text(draw, 700, 1208, f"₹{_format_amount(amount)}", _load_font(44, bold=True), fill="#0F4C81")
+    _draw_centered_text(draw, 700, 1260, f"Payee: {DEFAULT_PAYEE_NAME}", body_font, fill="#243B53")
+
+    details_top = 1330
+    details_left = 180
+    details_right = 1220
+    draw.rounded_rectangle((details_left, details_top, details_right, 1515), radius=32, fill="#F8FBFF", outline="#DDE7F3", width=2)
+
+    draw.text((220, details_top + 26), "Purpose", font=label_font, fill="#5B7083")
+    draw.text((390, details_top + 26), purpose, font=body_font, fill="#102A43")
+    draw.text((220, details_top + 98), "UPI ID", font=label_font, fill="#5B7083")
+    draw.text((390, details_top + 98), DEFAULT_UPI_ID, font=body_font, fill="#102A43")
+
+    footer = f"{BRAND_NAME} • {purpose}"
+    footer_width, _ = _text_size(draw, footer, small_font)
+    draw.text(((canvas.width - footer_width) // 2, 1568), footer, font=small_font, fill="#66788A")
+
+    output = BytesIO()
+    canvas.save(output, format="PNG", optimize=True)
+    return output.getvalue()
 
 
 def _now_ist() -> str:
     return datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S IST")
 
 
-async def _verify_payment_vc(order_id: str, amount: str) -> str:
-    """
-    Call the VC Store payment verification API.
-    Returns "success", "pending", or "failed".
-    """
-    logger.info("API key loaded: %s", bool(VC_API_KEY))
-    if not VC_API_URL or not VC_API_KEY:
-        logger.warning("VC_API_URL or VC_API_KEY is not configured")
+def _parse_amount_from_text(text: str) -> Decimal | None:
+    match = re.search(r"₹\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", text, re.IGNORECASE)
+    if not match:
+        return None
+    normalized = match.group(1).replace(",", "")
+    try:
+        return Decimal(normalized).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _decode_imap_part(value: bytes | None) -> str:
+    if not value:
+        return ""
+    for encoding in ("utf-8", "latin-1"):
+        try:
+            return value.decode(encoding, errors="replace")
+        except Exception:
+            continue
+    return value.decode("utf-8", errors="replace")
+
+
+def _extract_text_from_message(msg) -> str:
+    if msg.is_multipart():
+        parts: list[str] = []
+        for part in msg.walk():
+            if part.get_content_disposition() == "attachment":
+                continue
+            if part.get_content_type().startswith("text/"):
+                try:
+                    payload = part.get_content()
+                except Exception:
+                    payload = part.get_payload(decode=True)
+                if payload:
+                    parts.append(str(payload))
+        return "\n".join(parts)
+    try:
+        payload = msg.get_content()
+    except Exception:
+        payload = msg.get_payload(decode=True)
+    return str(payload) if payload is not None else ""
+
+
+def _parse_famapp_email(raw_message: bytes, message_id: str) -> dict | None:
+    try:
+        message = email.message_from_bytes(raw_message, policy=policy.default)
+    except Exception:
+        return None
+    subject = str(message.get("Subject", ""))
+    body = _extract_text_from_message(message)
+    combined_text = f"{subject}\n{body}"
+    purpose_pattern = re.compile(rf"\b{re.escape((PURPOSE_PREFIX or 'FAP').upper())}-[A-Z0-9]{{8}}-[A-Z0-9]{{6}}\b")
+    purpose = purpose_pattern.search(combined_text)
+    amount = _parse_amount_from_text(combined_text)
+    date_value = message.get("Date")
+    timestamp = datetime.now(timezone.utc)
+    if date_value:
+        try:
+            parsed = parsedate_to_datetime(date_value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            timestamp = parsed.astimezone(timezone.utc)
+        except Exception:
+            pass
+    return {
+        "message_id": message_id,
+        "subject": subject,
+        "body": body,
+        "timestamp": timestamp,
+        "purpose": purpose.group(0) if purpose else None,
+        "amount": amount,
+    }
+
+
+async def _verify_payment_famapp(order_id: str, amount: str) -> str:
+    """Verify a FamApp order via Gmail IMAP using the same purpose+amount matching pattern as the upstream repo."""
+    if not IMAP_USERNAME or not IMAP_APP_PASSWORD:
+        logger.warning("FamApp IMAP credentials are missing for order %s", order_id)
         return "error"
 
+    order = await get_order(order_id)
+    if not order:
+        return "failed"
+
+    expected_amount = Decimal(str(amount or order.get("final_price") or order.get("plan_price") or "0")).quantize(Decimal("0.01"))
+    expected_purpose = order.get("payment_purpose") or _generate_famapp_purpose()
+    expiry = None
+    if order.get("expires_at"):
+        try:
+            expiry = datetime.fromisoformat(str(order["expires_at"]))
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            expiry = expiry.astimezone(timezone.utc)
+        except Exception:
+            expiry = None
+    if expiry and datetime.now(timezone.utc) >= expiry:
+        return "expired"
+
     try:
-        params = {"api_key": VC_API_KEY, "order_id": order_id, "amount": amount}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                VC_API_URL,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                raw_text = await resp.text()
-                final_url = str(resp.url)
-                http_status = resp.status
-                logger.info("Final Request URL: %s", final_url)
-                logger.info("HTTP Status: %s", http_status)
-                logger.info("Raw Response: %r", raw_text)
-                try:
-                    data = __import__("json").loads(raw_text)
-                except Exception:
-                    logger.error("VC API returned non-JSON for order %s", order_id)
-                    return "error"
-                status = str(data.get("status", "")).lower()
-                if status == "success":
+        imap_client = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        status, _ = imap_client.login(IMAP_USERNAME, IMAP_APP_PASSWORD)
+        if status != "OK":
+            imap_client.logout()
+            return "error"
+        search_from = IMAP_SENDER_FILTER or "no-reply@famapp.in"
+        imap_client.select(IMAP_MAILBOX or "INBOX")
+        search_status, data = imap_client.search(None, "FROM", search_from, "SINCE", (datetime.now(timezone.utc) - timedelta(hours=GMAIL_LOOKBACK_HOURS)).strftime("%d-%b-%Y"))
+        if search_status != "OK":
+            imap_client.close()
+            imap_client.logout()
+            return "pending"
+        message_ids = data[0].split() if data and data[0] else []
+        for message_id in message_ids:
+            try:
+                fetch_status, fetched = imap_client.fetch(message_id, "(RFC822)")
+            except imaplib.IMAP4.error:
+                continue
+            if fetch_status != "OK":
+                continue
+            for part in fetched:
+                if isinstance(part, tuple) and len(part) >= 2:
+                    raw_message = part[1]
+                    parsed = _parse_famapp_email(raw_message, message_id.decode("ascii", errors="ignore"))
+                    if not parsed:
+                        continue
+                    subject = (parsed.get("subject") or "").strip()
+                    body = (parsed.get("body") or "").strip()
+                    if re.search(r"your payment of ₹.* is successful", subject, re.IGNORECASE) or re.search(r"you have successfully paid", body, re.IGNORECASE):
+                        continue
+                    if not re.search(r"you received ₹.* in your famx account", subject, re.IGNORECASE) or not re.search(r"you have successfully received", body, re.IGNORECASE):
+                        continue
+                    if parsed.get("purpose") != expected_purpose:
+                        continue
+                    if parsed.get("amount") != expected_amount:
+                        continue
+                    imap_client.close()
+                    imap_client.logout()
                     return "success"
-                elif status == "pending":
-                    return "pending"
-                else:
-                    return "failed"
+        imap_client.close()
+        imap_client.logout()
+        return "pending"
     except Exception:
-        logger.exception("VC API call failed for order %s", order_id)
+        logger.exception("FamApp Gmail IMAP verification failed for order %s", order_id)
         return "error"
 
 
@@ -151,6 +382,11 @@ async def _send_payment_screen(
     """
     # Retry up to 5 times on PK collision
     order_id: str | None = None
+    famapp_purpose = _generate_famapp_purpose()
+    famapp_upi_uri = _build_famapp_upi_uri(final_price_str, famapp_purpose)
+    famapp_qr_bytes = _generate_famapp_qr_bytes(final_price_str, famapp_purpose)
+    famapp_expires_at = datetime.now(timezone.utc) + timedelta(minutes=int(ORDER_EXPIRY_MINUTES or 15))
+
     for _ in range(5):
         candidate = _make_order_id()
         try:
@@ -164,6 +400,11 @@ async def _send_payment_screen(
                 access_link=plan["access_link"],
                 final_price=final_price_str,
                 referral_discount_used=discount_pct,
+                payment_purpose=famapp_purpose,
+                upi_uri=famapp_upi_uri,
+                payee_name=DEFAULT_PAYEE_NAME,
+                qr_image=famapp_qr_bytes,
+                expires_at=famapp_expires_at,
             )
             order_id = candidate
             break
@@ -205,15 +446,16 @@ async def _send_payment_screen(
         logger.warning("payment_message template is malformed — using default")
         payment_msg_text = _default_tpl.format(**_fmt_kwargs)
 
-    # Send QR photo and capture its message ID
-    qr_url = _make_upi_qr_url(order_id, final_price_str)
-    logger.info("UPI QR URL for order %s: %s", order_id, qr_url)
+    # Send FamApp QR image and capture its message ID.
+    qr_data = BytesIO(famapp_qr_bytes)
+    qr_data.name = f"{order_id}.png"
+    logger.info("FamApp UPI URI for order %s: %s", order_id, famapp_upi_uri)
     qr_msg_id: int | None = None
     try:
-        qr_msg = await bot.send_photo(chat_id=chat_id, photo=qr_url)
+        qr_msg = await bot.send_photo(chat_id=chat_id, photo=BufferedInputFile(qr_data.getvalue(), filename=qr_data.name))
         qr_msg_id = qr_msg.message_id
     except Exception:
-        logger.exception("Failed to send QR image for order %s", order_id)
+        logger.exception("Failed to send FamApp QR image for order %s", order_id)
 
     # Send payment details message and capture its message ID
     pay_msg = await bot.send_message(
@@ -482,12 +724,12 @@ async def callback_buy(call: CallbackQuery, bot: Bot) -> None:
         )
 
 
-# ── I Have Paid → automatic VC verification ───────────────────────────────────
+# ── I Have Paid → automatic FamApp verification ──────────────────────────────
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("paid:"))
 async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
-    """Verify payment automatically via VC Store API and activate instantly on success."""
+    """Verify payment automatically via FamApp IMAP and activate it on success."""
     await call.answer()
     order_id = call.data.split(":", 1)[1]
     user = call.from_user
@@ -521,7 +763,7 @@ async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
         "⏳ <b>Verifying your payment...</b>\n\nPlease wait a moment."
     )
 
-    status = await _verify_payment_vc(order_id, final_price)
+    status = await _verify_payment_famapp(order_id, final_price)
 
     if status == "success":
         # Set to pending first (approve_order requires pending status)
