@@ -223,7 +223,7 @@ def _now_ist() -> str:
 
 
 def _parse_amount_from_text(text: str) -> Decimal | None:
-    match = re.search(r"₹\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", text, re.IGNORECASE)
+    match = re.search(r"₹\s*([0-9][0-9,]*(?:\.\d+)?)", text, re.IGNORECASE)
     if not match:
         return None
     normalized = match.group(1).replace(",", "")
@@ -273,7 +273,8 @@ def _parse_famapp_email(raw_message: bytes, message_id: str) -> dict | None:
     subject = str(message.get("Subject", ""))
     body = _extract_text_from_message(message)
     combined_text = f"{subject}\n{body}"
-    purpose_pattern = re.compile(rf"\b{re.escape((PURPOSE_PREFIX or 'FAP').upper())}-[A-Z0-9]{{8}}-[A-Z0-9]{{6}}\b")
+    prefix = (PURPOSE_PREFIX or "FAP").upper()
+    purpose_pattern = re.compile(rf"(?i)\b{re.escape(prefix)}-[A-Z0-9]{{8}}-[A-Z0-9]{{6}}\b")
     purpose = purpose_pattern.search(combined_text)
     amount = _parse_amount_from_text(combined_text)
     date_value = message.get("Date")
@@ -326,14 +327,39 @@ async def _verify_payment_famapp(order_id: str, amount: str) -> str:
         if status != "OK":
             imap_client.logout()
             return "error"
-        search_from = IMAP_SENDER_FILTER or "no-reply@famapp.in"
-        imap_client.select(IMAP_MAILBOX or "INBOX")
-        search_status, data = imap_client.search(None, "FROM", search_from, "SINCE", (datetime.now(timezone.utc) - timedelta(hours=GMAIL_LOOKBACK_HOURS)).strftime("%d-%b-%Y"))
-        if search_status != "OK":
+
+        mailbox = IMAP_MAILBOX or "INBOX"
+        imap_client.select(mailbox)
+        sender_candidates: list[str] = []
+        configured_sender = (IMAP_SENDER_FILTER or "").strip()
+        if configured_sender:
+            sender_candidates.append(configured_sender)
+            if "@" in configured_sender:
+                sender_candidates.append(configured_sender.rsplit("@", 1)[1])
+        if not sender_candidates:
+            sender_candidates = ["famapp", "famx"]
+
+        seen_message_ids: set[bytes] = set()
+        for sender_filter in sender_candidates:
+            if not sender_filter:
+                continue
+            search_status, data = imap_client.search(
+                None,
+                "FROM",
+                sender_filter,
+                "SINCE",
+                (datetime.now(timezone.utc) - timedelta(hours=GMAIL_LOOKBACK_HOURS)).strftime("%d-%b-%Y"),
+            )
+            if search_status == "OK" and data and data[0]:
+                for message_id in data[0].split():
+                    seen_message_ids.add(message_id)
+
+        message_ids = sorted(seen_message_ids)
+        if not message_ids:
             imap_client.close()
             imap_client.logout()
             return "pending"
-        message_ids = data[0].split() if data and data[0] else []
+
         for message_id in message_ids:
             try:
                 fetch_status, fetched = imap_client.fetch(message_id, "(RFC822)")
@@ -349,9 +375,13 @@ async def _verify_payment_famapp(order_id: str, amount: str) -> str:
                         continue
                     subject = (parsed.get("subject") or "").strip()
                     body = (parsed.get("body") or "").strip()
+
                     if re.search(r"your payment of ₹.* is successful", subject, re.IGNORECASE) or re.search(r"you have successfully paid", body, re.IGNORECASE):
                         continue
-                    if not re.search(r"you received ₹.* in your famx account", subject, re.IGNORECASE) or not re.search(r"you have successfully received", body, re.IGNORECASE):
+
+                    if not re.search(r"you\s+received\s+₹\s*\d[0-9,]*(?:\.\d+)?\s+in\s+your\s+famx\s+account", subject, re.IGNORECASE):
+                        continue
+                    if not re.search(r"you\s+have\s+successfully\s+received", body, re.IGNORECASE):
                         continue
                     if parsed.get("purpose") != expected_purpose:
                         continue
