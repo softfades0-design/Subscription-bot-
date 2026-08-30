@@ -946,6 +946,8 @@ async def get_order(order_id: str) -> dict | None:
         "plan_id":       doc.get("plan_id"),
         "access_link":   doc.get("access_link", ""),
         "payment_status": doc.get("payment_status", ""),
+        "payment_purpose": doc.get("payment_purpose"),
+        "expires_at":    doc.get("expires_at"),
     }
 
 
