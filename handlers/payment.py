@@ -24,6 +24,7 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from email import policy
 from email.utils import parseaddr, parsedate_to_datetime
+from html.parser import HTMLParser
 from io import BytesIO
 
 import qrcode
@@ -172,25 +173,109 @@ def _decode_imap_part(value: bytes | None) -> str:
     return value.decode("utf-8", errors="replace")
 
 
+class _FamAppHTMLTextParser(HTMLParser):
+    """Convert an HTML email body to text while preserving useful spacing."""
+
+    _BLOCK_TAGS = {
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "br",
+        "dd",
+        "div",
+        "dl",
+        "dt",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "li",
+        "main",
+        "nav",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "tr",
+        "ul",
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._chunks: list[str] = []
+        self._ignored_depth = 0
+
+    def handle_starttag(self, tag: str, _attrs) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style"}:
+            self._ignored_depth += 1
+            return
+        if self._ignored_depth == 0 and tag in self._BLOCK_TAGS:
+            self._chunks.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style"}:
+            self._ignored_depth = max(0, self._ignored_depth - 1)
+            return
+        if self._ignored_depth == 0 and tag in self._BLOCK_TAGS:
+            self._chunks.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored_depth == 0:
+            self._chunks.append(data)
+
+    def get_text(self) -> str:
+        return "".join(self._chunks)
+
+
+def _html_to_readable_text(value: str) -> str:
+    parser = _FamAppHTMLTextParser()
+    try:
+        parser.feed(value)
+        parser.close()
+    except Exception:
+        # Keep any text already parsed; malformed email HTML must not prevent
+        # amount/purpose extraction from the other MIME parts.
+        pass
+    return parser.get_text()
+
+
+def _get_message_part_text(part) -> str:
+    try:
+        payload = part.get_content()
+    except Exception:
+        payload = part.get_payload(decode=True)
+    if isinstance(payload, bytes):
+        return _decode_imap_part(payload)
+    return str(payload) if payload is not None else ""
+
+
 def _extract_text_from_message(msg) -> str:
     if msg.is_multipart():
         parts: list[str] = []
         for part in msg.walk():
             if part.get_content_disposition() == "attachment":
                 continue
-            if part.get_content_type().startswith("text/"):
-                try:
-                    payload = part.get_content()
-                except Exception:
-                    payload = part.get_payload(decode=True)
-                if payload:
-                    parts.append(str(payload))
+            content_type = part.get_content_type().lower()
+            if content_type == "text/plain":
+                text = _get_message_part_text(part)
+            elif content_type == "text/html":
+                text = _html_to_readable_text(_get_message_part_text(part))
+            else:
+                continue
+            if text:
+                parts.append(text)
         return "\n".join(parts)
-    try:
-        payload = msg.get_content()
-    except Exception:
-        payload = msg.get_payload(decode=True)
-    return str(payload) if payload is not None else ""
+    content_type = msg.get_content_type().lower()
+    text = _get_message_part_text(msg)
+    return _html_to_readable_text(text) if content_type == "text/html" else text
 
 
 def _mask_sender(sender: str | None) -> str:
@@ -213,7 +298,10 @@ def _parse_famapp_email(raw_message: bytes, message_id: str) -> dict | None:
     body = _extract_text_from_message(message)
     combined_text = f"{subject}\n{body}"
     prefix = (PURPOSE_PREFIX or "FAP").upper()
-    purpose_pattern = re.compile(rf"(?i)\b{re.escape(prefix)}-[A-Z0-9]{{8}}-[A-Z0-9]{{6}}\b")
+    purpose_pattern = re.compile(
+        rf"(?i)\bPurpose\s*:\s*"
+        rf"({re.escape(prefix)}-[A-Z0-9]+(?:-[A-Z0-9]+)*)\b"
+    )
     purpose = purpose_pattern.search(combined_text)
     amount = _parse_amount_from_text(combined_text)
     date_value = message.get("Date")
@@ -232,7 +320,7 @@ def _parse_famapp_email(raw_message: bytes, message_id: str) -> dict | None:
         "subject": subject,
         "body": body,
         "timestamp": timestamp,
-        "purpose": purpose.group(0) if purpose else None,
+        "purpose": purpose.group(1) if purpose else None,
         "amount": amount,
     }
 
@@ -274,7 +362,7 @@ async def _verify_payment_famapp(order_id: str, amount: str) -> str:
         return "failed"
 
     expected_amount = Decimal(str(amount or order.get("final_price") or order.get("plan_price") or "0")).quantize(Decimal("0.01"))
-    expected_purpose = order.get("payment_purpose") or _generate_famapp_purpose()
+    expected_purpose = order.get("payment_purpose")
     payment_qr_upi_purpose = "<none>"
     stored_upi_uri = order.get("upi_uri") or ""
     if stored_upi_uri:
@@ -452,7 +540,10 @@ async def _verify_payment_famapp(order_id: str, amount: str) -> str:
                         re.search(r"you\s+have\s+successfully\s+received", body, re.IGNORECASE)
                     )
                     amount_match = parsed.get("amount") == expected_amount
-                    purpose_match = parsed.get("purpose") == expected_purpose
+                    purpose_match = (
+                        expected_purpose is not None
+                        and parsed.get("purpose") == expected_purpose
+                    )
                     final_match = (
                         not is_outgoing_payment
                         and is_received_subject

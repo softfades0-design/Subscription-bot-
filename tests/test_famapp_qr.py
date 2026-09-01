@@ -2,6 +2,7 @@ import asyncio
 import os
 import unittest
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from io import BytesIO
 from unittest.mock import AsyncMock, patch
 
@@ -29,7 +30,8 @@ Date: Sat, 29 Aug 2026 12:00:00 +0000
 Content-Type: text/plain; charset=utf-8
 
 You have successfully received \xe2\x82\xb91.0
-Payment purpose: FAP-20260829-XI61XD
+Purpose :
+FAP-20260829-XI61XD
 """
 
     def __init__(self, *_args):
@@ -107,6 +109,39 @@ class FamAppQrTests(unittest.TestCase):
         self.assertIn("amount_match=True", messages)
         self.assertIn("purpose_match=True", messages)
         self.assertIn("final_match=True", messages)
+
+    def test_parser_extracts_purpose_from_html_multipart_famapp_email(self):
+        message = EmailMessage()
+        message["From"] = "no-reply@famapp.in"
+        message["Subject"] = "You received ₹1.0 in your FamX account"
+        message["Date"] = "Sat, 29 Aug 2026 12:00:00 +0000"
+        message.set_content(
+            "You have successfully received\n"
+            "₹1.0\n"
+            "from ASHISH\n\n"
+            "Purpose :\n"
+            "FAP-20260829-XI61XD\n"
+        )
+        message.add_alternative(
+            """
+            <html><body>
+              <p>Example reference: FAP-20260829-UNRELATED</p>
+              <div><span>Purpose</span> :<br>
+                <span>FAP-20260829-XI61XD</span>
+              </div>
+            </body></html>
+            """,
+            subtype="html",
+        )
+
+        parsed = payment._parse_famapp_email(
+            bytes(message),
+            "html-multipart-1",
+        )
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["amount"], payment.Decimal("1.00"))
+        self.assertEqual(parsed["purpose"], "FAP-20260829-XI61XD")
 
 
 if __name__ == "__main__":
