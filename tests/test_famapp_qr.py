@@ -79,6 +79,7 @@ class FamAppQrTests(unittest.TestCase):
             "final_price": amount,
             "plan_price": amount,
             "payment_purpose": purpose,
+            "upi_uri": _build_famapp_upi_uri(amount, purpose),
             "expires_at": (
                 datetime.now(timezone.utc) + timedelta(minutes=10)
             ).isoformat(),
@@ -98,6 +99,7 @@ class FamAppQrTests(unittest.TestCase):
         get_order.assert_awaited_once_with(order_id)
         messages = "\n".join(logs.output)
         self.assertIn("candidate_email_count=1", messages)
+        self.assertIn(f"payment_qr_upi_purpose={purpose}", messages)
         self.assertIn("masked_sender=n***@famapp.in", messages)
         self.assertNotIn("no-reply@famapp.in", messages)
         self.assertIn("extracted_amount=1.00", messages)

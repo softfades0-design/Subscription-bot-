@@ -275,6 +275,18 @@ async def _verify_payment_famapp(order_id: str, amount: str) -> str:
 
     expected_amount = Decimal(str(amount or order.get("final_price") or order.get("plan_price") or "0")).quantize(Decimal("0.01"))
     expected_purpose = order.get("payment_purpose") or _generate_famapp_purpose()
+    payment_qr_upi_purpose = "<none>"
+    stored_upi_uri = order.get("upi_uri") or ""
+    if stored_upi_uri:
+        try:
+            payment_qr_upi_purpose = (
+                urllib.parse.parse_qs(
+                    urllib.parse.urlsplit(str(stored_upi_uri)).query
+                ).get("tn", [None])[0]
+                or "<none>"
+            )
+        except (TypeError, ValueError):
+            payment_qr_upi_purpose = "<invalid>"
     expiry = None
     expiry_status = "missing"
     if order.get("expires_at"):
@@ -450,7 +462,8 @@ async def _verify_payment_famapp(order_id: str, amount: str) -> str:
                     )
                     logger.info(
                         "FamApp verification order_id=%s expected_amount=%s "
-                        "expected_payment_purpose=%s imap_connection=success "
+                        "expected_payment_purpose=%s payment_qr_upi_purpose=%s "
+                        "imap_connection=success "
                         "selected_mailbox=%s candidate_email_count=%d "
                         "masked_sender=%s subject=%r extracted_amount=%s "
                         "extracted_purpose=%s amount_match=%s "
@@ -458,6 +471,7 @@ async def _verify_payment_famapp(order_id: str, amount: str) -> str:
                         order_id,
                         expected_amount,
                         expected_purpose,
+                        payment_qr_upi_purpose,
                         selected_mailbox,
                         candidate_email_count,
                         _mask_sender(parsed.get("sender")),
@@ -590,7 +604,11 @@ async def _send_payment_screen(
     # Send FamApp QR image and capture its message ID.
     qr_data = BytesIO(famapp_qr_bytes)
     qr_data.name = f"{order_id}.png"
-    logger.info("FamApp UPI URI for order %s: %s", order_id, famapp_upi_uri)
+    logger.info(
+        "FamApp payment order_id=%s payment_qr_upi_purpose=%s",
+        order_id,
+        famapp_purpose,
+    )
     qr_msg_id: int | None = None
     try:
         qr_msg = await bot.send_photo(chat_id=chat_id, photo=BufferedInputFile(qr_data.getvalue(), filename=qr_data.name))
