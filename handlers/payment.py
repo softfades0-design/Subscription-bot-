@@ -23,7 +23,7 @@ import urllib.parse
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from email import policy
-from email.utils import parsedate_to_datetime
+from email.utils import parseaddr, parsedate_to_datetime
 from io import BytesIO
 
 import qrcode
@@ -193,12 +193,23 @@ def _extract_text_from_message(msg) -> str:
     return str(payload) if payload is not None else ""
 
 
+def _mask_sender(sender: str | None) -> str:
+    """Keep verification diagnostics from exposing a complete sender address."""
+    _, address = parseaddr(sender or "")
+    value = address or (sender or "").strip()
+    if "@" in value:
+        local, domain = value.rsplit("@", 1)
+        return f"{local[:1]}***@{domain}"
+    return f"{value[:1]}***" if value else "<unknown>"
+
+
 def _parse_famapp_email(raw_message: bytes, message_id: str) -> dict | None:
     try:
         message = email.message_from_bytes(raw_message, policy=policy.default)
     except Exception:
         return None
     subject = str(message.get("Subject", ""))
+    sender = str(message.get("From", ""))
     body = _extract_text_from_message(message)
     combined_text = f"{subject}\n{body}"
     prefix = (PURPOSE_PREFIX or "FAP").upper()
@@ -217,6 +228,7 @@ def _parse_famapp_email(raw_message: bytes, message_id: str) -> dict | None:
             pass
     return {
         "message_id": message_id,
+        "sender": sender,
         "subject": subject,
         "body": body,
         "timestamp": timestamp,
@@ -228,36 +240,110 @@ def _parse_famapp_email(raw_message: bytes, message_id: str) -> dict | None:
 async def _verify_payment_famapp(order_id: str, amount: str) -> str:
     """Verify a FamApp order via Gmail IMAP using the same purpose+amount matching pattern as the upstream repo."""
     if not IMAP_USERNAME or not IMAP_APP_PASSWORD:
-        logger.warning("FamApp IMAP credentials are missing for order %s", order_id)
+        logger.info(
+            "FamApp verification order_id=%s expected_amount=%s "
+            "expected_payment_purpose=%s imap_connection=failure "
+            "selected_mailbox=%s candidate_email_count=%d "
+            "final_match=%s expiry_status=%s",
+            order_id,
+            "<unknown>",
+            "<unknown>",
+            "<not_selected>",
+            0,
+            False,
+            "not_checked",
+        )
         return "error"
 
     order = await get_order(order_id)
     if not order:
+        logger.info(
+            "FamApp verification order_id=%s expected_amount=%s "
+            "expected_payment_purpose=%s imap_connection=%s "
+            "selected_mailbox=%s candidate_email_count=%d "
+            "final_match=%s expiry_status=%s",
+            order_id,
+            "<unknown>",
+            "<unknown>",
+            "not_attempted",
+            "<not_selected>",
+            0,
+            False,
+            "not_checked",
+        )
         return "failed"
 
     expected_amount = Decimal(str(amount or order.get("final_price") or order.get("plan_price") or "0")).quantize(Decimal("0.01"))
     expected_purpose = order.get("payment_purpose") or _generate_famapp_purpose()
     expiry = None
+    expiry_status = "missing"
     if order.get("expires_at"):
         try:
             expiry = datetime.fromisoformat(str(order["expires_at"]))
             if expiry.tzinfo is None:
                 expiry = expiry.replace(tzinfo=timezone.utc)
             expiry = expiry.astimezone(timezone.utc)
+            expiry_status = "expired" if datetime.now(timezone.utc) >= expiry else "active"
         except Exception:
             expiry = None
+            expiry_status = "invalid"
     if expiry and datetime.now(timezone.utc) >= expiry:
+        logger.info(
+            "FamApp verification order_id=%s expected_amount=%s "
+            "expected_payment_purpose=%s imap_connection=not_attempted "
+            "selected_mailbox=%s candidate_email_count=%d "
+            "final_match=%s expiry_status=%s",
+            order_id,
+            expected_amount,
+            expected_purpose,
+            "<not_selected>",
+            0,
+            False,
+            expiry_status,
+        )
         return "expired"
 
+    selected_mailbox = "<not_selected>"
+    candidate_email_count = 0
     try:
         imap_client = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         status, _ = imap_client.login(IMAP_USERNAME, IMAP_APP_PASSWORD)
         if status != "OK":
-            imap_client.logout()
+            logger.info(
+                "FamApp verification order_id=%s expected_amount=%s "
+                "expected_payment_purpose=%s imap_connection=failure "
+                "selected_mailbox=%s candidate_email_count=%d "
+                "final_match=%s expiry_status=%s",
+                order_id,
+                expected_amount,
+                expected_purpose,
+                selected_mailbox,
+                candidate_email_count,
+                False,
+                expiry_status,
+            )
+            try:
+                imap_client.logout()
+            except Exception:
+                pass
             return "error"
 
         mailbox = IMAP_MAILBOX or "INBOX"
+        selected_mailbox = mailbox
         imap_client.select(mailbox)
+        logger.info(
+            "FamApp verification order_id=%s expected_amount=%s "
+            "expected_payment_purpose=%s imap_connection=success "
+            "selected_mailbox=%s candidate_email_count=%d "
+            "final_match=%s expiry_status=%s",
+            order_id,
+            expected_amount,
+            expected_purpose,
+            selected_mailbox,
+            candidate_email_count,
+            False,
+            expiry_status,
+        )
         sender_candidates: list[str] = []
         configured_sender = (IMAP_SENDER_FILTER or "").strip()
         if configured_sender:
@@ -283,6 +369,20 @@ async def _verify_payment_famapp(order_id: str, amount: str) -> str:
                     seen_message_ids.add(message_id)
 
         message_ids = sorted(seen_message_ids)
+        candidate_email_count = len(message_ids)
+        logger.info(
+            "FamApp verification order_id=%s expected_amount=%s "
+            "expected_payment_purpose=%s imap_connection=success "
+            "selected_mailbox=%s candidate_email_count=%d "
+            "final_match=%s expiry_status=%s",
+            order_id,
+            expected_amount,
+            expected_purpose,
+            selected_mailbox,
+            candidate_email_count,
+            False,
+            expiry_status,
+        )
         if not message_ids:
             imap_client.close()
             imap_client.logout()
@@ -300,20 +400,84 @@ async def _verify_payment_famapp(order_id: str, amount: str) -> str:
                     raw_message = part[1]
                     parsed = _parse_famapp_email(raw_message, message_id.decode("ascii", errors="ignore"))
                     if not parsed:
+                        logger.info(
+                            "FamApp verification order_id=%s expected_amount=%s "
+                            "expected_payment_purpose=%s imap_connection=success "
+                            "selected_mailbox=%s candidate_email_count=%d "
+                            "masked_sender=%s subject=%s extracted_amount=%s "
+                            "extracted_purpose=%s amount_match=%s "
+                            "purpose_match=%s final_match=%s expiry_status=%s",
+                            order_id,
+                            expected_amount,
+                            expected_purpose,
+                            selected_mailbox,
+                            candidate_email_count,
+                            "<unknown>",
+                            "<unparsed>",
+                            "<unknown>",
+                            "<unknown>",
+                            False,
+                            False,
+                            False,
+                            expiry_status,
+                        )
                         continue
                     subject = (parsed.get("subject") or "").strip()
                     body = (parsed.get("body") or "").strip()
 
-                    if re.search(r"your payment of ₹.* is successful", subject, re.IGNORECASE) or re.search(r"you have successfully paid", body, re.IGNORECASE):
+                    is_outgoing_payment = bool(
+                        re.search(r"your payment of ₹.* is successful", subject, re.IGNORECASE)
+                        or re.search(r"you have successfully paid", body, re.IGNORECASE)
+                    )
+                    is_received_subject = bool(
+                        re.search(
+                            r"you\s+received\s+₹\s*\d[0-9,]*(?:\.\d+)?\s+in\s+your\s+famx\s+account",
+                            subject,
+                            re.IGNORECASE,
+                        )
+                    )
+                    is_received_body = bool(
+                        re.search(r"you\s+have\s+successfully\s+received", body, re.IGNORECASE)
+                    )
+                    amount_match = parsed.get("amount") == expected_amount
+                    purpose_match = parsed.get("purpose") == expected_purpose
+                    final_match = (
+                        not is_outgoing_payment
+                        and is_received_subject
+                        and is_received_body
+                        and purpose_match
+                        and amount_match
+                    )
+                    logger.info(
+                        "FamApp verification order_id=%s expected_amount=%s "
+                        "expected_payment_purpose=%s imap_connection=success "
+                        "selected_mailbox=%s candidate_email_count=%d "
+                        "masked_sender=%s subject=%r extracted_amount=%s "
+                        "extracted_purpose=%s amount_match=%s "
+                        "purpose_match=%s final_match=%s expiry_status=%s",
+                        order_id,
+                        expected_amount,
+                        expected_purpose,
+                        selected_mailbox,
+                        candidate_email_count,
+                        _mask_sender(parsed.get("sender")),
+                        subject,
+                        parsed.get("amount") if parsed.get("amount") is not None else "<none>",
+                        parsed.get("purpose") or "<none>",
+                        amount_match,
+                        purpose_match,
+                        final_match,
+                        expiry_status,
+                    )
+                    if is_outgoing_payment:
                         continue
-
-                    if not re.search(r"you\s+received\s+₹\s*\d[0-9,]*(?:\.\d+)?\s+in\s+your\s+famx\s+account", subject, re.IGNORECASE):
+                    if not is_received_subject:
                         continue
-                    if not re.search(r"you\s+have\s+successfully\s+received", body, re.IGNORECASE):
+                    if not is_received_body:
                         continue
-                    if parsed.get("purpose") != expected_purpose:
+                    if not purpose_match:
                         continue
-                    if parsed.get("amount") != expected_amount:
+                    if not amount_match:
                         continue
                     imap_client.close()
                     imap_client.logout()
@@ -322,7 +486,19 @@ async def _verify_payment_famapp(order_id: str, amount: str) -> str:
         imap_client.logout()
         return "pending"
     except Exception:
-        logger.exception("FamApp Gmail IMAP verification failed for order %s", order_id)
+        logger.info(
+            "FamApp verification order_id=%s expected_amount=%s "
+            "expected_payment_purpose=%s imap_connection=failure "
+            "selected_mailbox=%s candidate_email_count=%d "
+            "final_match=%s expiry_status=%s",
+            order_id,
+            expected_amount,
+            expected_purpose,
+            selected_mailbox,
+            candidate_email_count,
+            False,
+            expiry_status,
+        )
         return "error"
 
 
