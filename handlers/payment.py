@@ -108,7 +108,7 @@ def _generate_famapp_purpose() -> str:
     prefix = "".join(ch for ch in str(PURPOSE_PREFIX or "FAP").upper() if ch.isalnum()) or "FAP"
     date_part = datetime.now(timezone.utc).strftime("%Y%m%d")
     suffix = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
-    return f"{prefix}-{date_part}-{suffix}"
+    return f"{prefix}{date_part}{suffix}"
 
 
 def _build_famapp_upi_uri(amount: str | Decimal, purpose: str) -> str:
@@ -300,7 +300,7 @@ def _parse_famapp_email(raw_message: bytes, message_id: str) -> dict | None:
     prefix = (PURPOSE_PREFIX or "FAP").upper()
     purpose_pattern = re.compile(
         rf"(?i)\bPurpose\s*:\s*"
-        rf"({re.escape(prefix)}-[A-Z0-9]+(?:-[A-Z0-9]+)*)\b"
+        rf"({re.escape(prefix)}[0-9]{{8}}[A-Z0-9]{{6}})\b"
     )
     purpose = purpose_pattern.search(combined_text)
     amount = _parse_amount_from_text(combined_text)
