@@ -11,6 +11,14 @@ def regenerate_payment_qr_keyboard(order_id: str) -> InlineKeyboardMarkup:
         ]
     )
 
+
+def payment_retry_keyboard(plan_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Try Again", callback_data=f"buy:{plan_id}")],
+        ]
+    )
+
 # ── Admin panel ───────────────────────────────────────────────────────────────
 
 def admin_panel_keyboard() -> InlineKeyboardMarkup:

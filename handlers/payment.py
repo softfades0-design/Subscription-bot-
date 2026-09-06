@@ -73,6 +73,7 @@ from keyboards.menu import (
     manual_review_keyboard,
     main_menu_keyboard,
     plans_list_keyboard,
+    payment_retry_keyboard,
 )
 from handlers.log_channel import log_payment_started, log_payment_success, log_payment_failed
 
@@ -670,6 +671,7 @@ async def _send_payment_screen(
                 expires_at=famapp_expires_at,
             )
             order_id = candidate
+            logger.info("ORDER CREATED order_id=%s user_id=%s plan_id=%s expires_at=%s", order_id, user_id, plan_id, famapp_expires_at.isoformat())
             break
         except Exception as exc:
             if "UNIQUE" in str(exc).upper():
@@ -713,7 +715,7 @@ async def _send_payment_screen(
     qr_data = BytesIO(famapp_qr_bytes)
     qr_data.name = f"{order_id}.png"
     logger.info(
-        "FamApp payment order_id=%s payment_qr_upi_purpose=%s",
+        "REQUESTING FAMAPP PAYMENT order_id=%s payment_qr_upi_purpose=%s",
         order_id,
         famapp_purpose,
     )
@@ -721,15 +723,29 @@ async def _send_payment_screen(
     try:
         qr_msg = await bot.send_photo(chat_id=chat_id, photo=BufferedInputFile(qr_data.getvalue(), filename=qr_data.name))
         qr_msg_id = qr_msg.message_id
+        logger.info("QR MESSAGE SENT order_id=%s message_id=%s", order_id, qr_msg_id)
     except Exception:
         logger.exception("Failed to send FamApp QR image for order %s", order_id)
+        await update_order_status(order_id, "failed")
+        raise
 
     # Send payment details message and capture its message ID
-    pay_msg = await bot.send_message(
-        chat_id,
-        payment_msg_text,
-        reply_markup=payment_details_keyboard(order_id),
-    )
+    try:
+        pay_msg = await bot.send_message(
+            chat_id,
+            payment_msg_text,
+            reply_markup=payment_details_keyboard(order_id),
+        )
+        logger.info("PAYMENT MESSAGE SENT order_id=%s message_id=%s", order_id, pay_msg.message_id)
+    except Exception:
+        logger.exception("Failed to send payment details order_id=%s", order_id)
+        await update_order_status(order_id, "failed")
+        if qr_msg_id:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=qr_msg_id)
+            except Exception:
+                logger.exception("Failed to clean up QR after payment message failure order_id=%s", order_id)
+        raise
 
     # Store full context for the verification handler
     _awaiting_proof[user_id] = {
@@ -746,6 +762,7 @@ async def _send_payment_screen(
         "payment_msg_id": pay_msg.message_id,
     }
     await update_order_messages(order_id, user_id, qr_msg_id, pay_msg.message_id)
+    logger.info("ORDER/PAYMENT MESSAGE TRACKED order_id=%s", order_id)
 
     # Schedule abandoned-payment reminders
     _MAX_REMINDER_DELAY_MIN = 525600  # 1 year
@@ -936,27 +953,36 @@ async def callback_regenerate_payment_qr(call: CallbackQuery, bot: Bot) -> None:
     # plan checks, payment mode, pricing, QR creation, and cleanup behavior.
     try:
         await call.message.delete()
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "Could not delete expired-payment message order_id=%s exception_type=%s exception=%s",
+            order_id,
+            type(exc).__name__,
+            str(exc),
+        )
         try:
             await call.message.edit_reply_markup(reply_markup=None)
         except Exception:
-            pass
-    call.data = f"buy:{plan_id}"
-    await callback_buy(call, bot)
+            logger.exception("Could not remove expired-payment button order_id=%s", order_id)
+    await callback_buy(call, bot, plan_id=plan_id)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("buy:"))
-async def callback_buy(call: CallbackQuery, bot: Bot) -> None:
+async def callback_buy(
+    call: CallbackQuery,
+    bot: Bot,
+    plan_id: int | None = None,
+) -> None:
     """User tapped Buy Now — load plan from DB, generate order, show payment details."""
-    logger.info("BUY CALLBACK HIT")
-    print("BUY CALLBACK HIT:", call.data)
+    logger.info("BUY CALLBACK HIT callback_data=%s", call.data)
     await call.answer()
 
-    try:
-        plan_id = int(call.data.split(":", 1)[1])
-    except (ValueError, IndexError):
-        await call.message.answer("⚠️ Invalid plan. Please try again.")
-        return
+    if plan_id is None:
+        try:
+            plan_id = int(call.data.split(":", 1)[1])
+        except (AttributeError, ValueError, IndexError):
+            await call.message.answer("⚠️ Invalid plan. Please try again.")
+            return
 
     user = call.from_user
     lock_key = (user.id, plan_id)
@@ -967,13 +993,17 @@ async def callback_buy(call: CallbackQuery, bot: Bot) -> None:
 
     await flow_lock.acquire()
     generating_msg = None
+    generation_succeeded = False
     try:
         generating_msg = await call.message.answer("⏳ Generating Payment QR...")
+        logger.info("BUY GENERATING MESSAGE SENT user_id=%s plan_id=%s", user.id, plan_id)
 
         plan = await get_plan(plan_id)
         if not plan:
+            logger.error("PLAN RESOLUTION FAILED user_id=%s plan_id=%s", user.id, plan_id)
             await call.message.answer("⚠️ Plan not found. It may have been removed.")
             return
+        logger.info("PLAN RESOLVED user_id=%s plan_id=%s plan_name=%s", user.id, plan_id, plan["name"])
 
         await cancel_start_reminders(user.id)
 
@@ -1018,6 +1048,7 @@ async def callback_buy(call: CallbackQuery, bot: Bot) -> None:
         # Repeated clicks while an order is still live must not create a
         # second payable order. Expired orders are excluded and can be replaced.
         if await get_active_order_for_user_plan(user.id, plan_id):
+            logger.info("ACTIVE PAYMENT ORDER EXISTS user_id=%s plan_id=%s", user.id, plan_id)
             await call.answer("⏳ You already have a payment in progress.", show_alert=False)
             return
 
@@ -1025,7 +1056,7 @@ async def callback_buy(call: CallbackQuery, bot: Bot) -> None:
         payment_mode = (await get_setting("payment_mode", "automatic")) or "automatic"
 
         if payment_mode == "manual":
-            await _send_manual_payment_screen(
+            new_order_id = await _send_manual_payment_screen(
                 bot=bot,
                 chat_id=call.message.chat.id,
                 user_id=user.id,
@@ -1036,7 +1067,7 @@ async def callback_buy(call: CallbackQuery, bot: Bot) -> None:
                 discount_pct=discount_pct,
             )
         else:
-            await _send_payment_screen(
+            new_order_id = await _send_payment_screen(
                 bot=bot,
                 chat_id=call.message.chat.id,
                 user_id=user.id,
@@ -1046,12 +1077,32 @@ async def callback_buy(call: CallbackQuery, bot: Bot) -> None:
                 price_section=price_section,
                 discount_pct=discount_pct,
             )
-    finally:
+        if not new_order_id:
+            raise RuntimeError("payment screen creation returned no order ID")
+        generation_succeeded = True
+        logger.info("BUY PAYMENT SCREEN READY user_id=%s plan_id=%s order_id=%s", user.id, plan_id, new_order_id)
+    except Exception as exc:
+        logger.exception(
+            "BUY FLOW FAILED user_id=%s plan_id=%s exception_type=%s exception=%s",
+            user.id,
+            plan_id,
+            type(exc).__name__,
+            str(exc),
+        )
         if generating_msg is not None:
+            try:
+                await generating_msg.edit_text(
+                    "⚠️ Payment QR generation failed. Please try again.",
+                    reply_markup=payment_retry_keyboard(plan_id),
+                )
+            except Exception:
+                logger.exception("Failed to render Buy Now error user_id=%s plan_id=%s", user.id, plan_id)
+    finally:
+        if generating_msg is not None and generation_succeeded:
             try:
                 await generating_msg.delete()
             except Exception:
-                logger.debug("Failed to delete payment generation message", exc_info=True)
+                logger.exception("Failed to delete successful generation message user_id=%s plan_id=%s", user.id, plan_id)
         flow_lock.release()
         if _payment_generation_locks.get(lock_key) is flow_lock:
             _payment_generation_locks.pop(lock_key, None)
