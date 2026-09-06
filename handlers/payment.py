@@ -64,7 +64,6 @@ from database import (
     cancel_reminder,
     clear_plan_interest,
     cancel_start_reminders,
-    get_active_order_for_user_plan,
     update_order_messages,
 )
 from keyboards.menu import (
@@ -1198,49 +1197,8 @@ async def callback_buy(
             f"💳 <b>Final Price:</b> ₹{final_price_str}"
         )
 
-        # Repeated clicks must not create a second payable order. Restore the
-        # existing order's screen instead; the lookup excludes expired orders.
-        active_order = await get_active_order_for_user_plan(user.id, plan_id)
-        if active_order:
-            existing_order_id = active_order["_id"]
-            logger.info(
-                "ACTIVE PAYMENT ORDER EXISTS user_id=%s plan_id=%s order_id=%s status=%s expires_at=%s "
-                "stored_qr_message_id=%s stored_payment_message_id=%s qr_data=%s",
-                user.id,
-                plan_id,
-                existing_order_id,
-                active_order.get("payment_status"),
-                active_order.get("expires_at"),
-                active_order.get("qr_message_id"),
-                active_order.get("payment_message_id"),
-                bool(active_order.get("qr_image") or active_order.get("payment_purpose")),
-            )
-            try:
-                restored = await _restore_existing_payment_screen(
-                    bot=bot,
-                    chat_id=call.message.chat.id,
-                    user_id=user.id,
-                    plan=plan,
-                    order=active_order,
-                    price_section=price_section,
-                )
-                if restored:
-                    generation_succeeded = True
-                    logger.info("BUY CALLBACK RETURN: existing active order reused order_id=%s", existing_order_id)
-                    return
-            except Exception as exc:
-                logger.exception(
-                    "ACTIVE PAYMENT SCREEN RESTORE FAILED order_id=%s exception_type=%s exception=%s",
-                    existing_order_id,
-                    type(exc).__name__,
-                    str(exc),
-                )
-            # The old pending order cannot present a usable payment screen.
-            # Make it terminal before creating exactly one fresh order.
-            await update_order_status(existing_order_id, "failed")
-            logger.warning("ACTIVE PAYMENT ORDER MARKED FAILED order_id=%s; creating fresh order", existing_order_id)
-
-        # Route to manual or automatic payment screen based on current setting
+        # Every Buy Now click creates a completely fresh order and QR.
+        # We intentionally do not restore or reuse a prior pending order.
         payment_mode = (await get_setting("payment_mode", "automatic")) or "automatic"
 
         if payment_mode == "manual":

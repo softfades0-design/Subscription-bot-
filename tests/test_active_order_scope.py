@@ -1,11 +1,15 @@
 import asyncio
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+os.environ.setdefault("BOT_TOKEN", "test-token")
+os.environ.setdefault("ADMIN_IDS", "1")
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017")
 
 import database  # noqa: E402
+import handlers.payment as payment  # noqa: E402
 
 
 class ActiveOrderScopeTests(unittest.TestCase):
@@ -22,6 +26,46 @@ class ActiveOrderScopeTests(unittest.TestCase):
         self.assertEqual(query["user_id"], 7)
         self.assertEqual(query["plan_id"], 27)
         self.assertEqual(query["payment_status"], {"$in": ["created", "pending"]})
+
+    def test_buy_now_does_not_reuse_existing_order(self):
+        class DummyMessage:
+            def __init__(self):
+                self.chat = SimpleNamespace(id=123)
+                self.answer = AsyncMock(return_value=SimpleNamespace(message_id=99))
+                self.delete = AsyncMock()
+                self.edit_text = AsyncMock()
+                self.edit_reply_markup = AsyncMock()
+
+        class DummyCall:
+            def __init__(self):
+                self.data = "buy:27"
+                self.message = DummyMessage()
+                self.from_user = SimpleNamespace(id=7, first_name="Demo")
+
+            async def answer(self, *args, **kwargs):
+                return None
+
+        async def run_test():
+            with (
+                patch.object(payment, "cancel_start_reminders", AsyncMock()),
+                patch.object(payment, "user_has_active_plan", AsyncMock(return_value=False)),
+                patch.object(payment, "log_payment_started", AsyncMock()),
+                patch.object(payment, "clear_plan_interest", AsyncMock()),
+                patch.object(payment, "get_user_referral_info", AsyncMock(return_value={"referral_discount": 0})),
+                patch.object(payment, "get_plan", AsyncMock(return_value={
+                    "name": "Gold",
+                    "price": "199",
+                    "validity": "30 days",
+                    "access_link": "https://example.com/access",
+                })),
+                patch.object(payment, "get_setting", AsyncMock(return_value="automatic")),
+                patch.object(database, "get_active_order_for_user_plan", AsyncMock(side_effect=AssertionError("reused order should not be checked"))),
+                patch.object(payment, "_send_payment_screen", AsyncMock(return_value="ORD-NEW-1")) as send_screen,
+            ):
+                await payment.callback_buy(DummyCall(), bot=AsyncMock())
+            send_screen.assert_awaited_once()
+
+        asyncio.run(run_test())
 
 
 if __name__ == "__main__":
