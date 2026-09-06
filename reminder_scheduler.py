@@ -37,8 +37,12 @@ from database import (
     advance_start_reminder,
     cancel_start_reminders,
     get_all_plans,
+    get_due_demo_sessions,
+    claim_demo_expiry,
+    mark_demo_deleted,
+    retry_demo_expiry,
 )
-from keyboards.menu import reminder_buy_now_keyboard, referral_reminder_keyboard, plan_interest_reminder_keyboard
+from keyboards.menu import reminder_buy_now_keyboard, referral_reminder_keyboard, plan_interest_reminder_keyboard, regenerate_demo_keyboard
 from keyboards.menu import plans_list_keyboard
 
 logger = logging.getLogger(__name__)
@@ -93,6 +97,8 @@ async def run(bot: Bot) -> None:
 
 
 async def _tick(bot: Bot) -> None:
+    await _tick_demo_sessions(bot)
+
     enabled = (await get_setting("reminder_enabled", "1")) == "1"
     if not enabled:
         return
@@ -211,3 +217,28 @@ async def _tick(bot: Bot) -> None:
             )
         except Exception:
             logger.warning("Failed to send start follow-up reminder to user %s", user_id)
+
+
+async def _tick_demo_sessions(bot: Bot) -> None:
+    now = datetime.now(timezone.utc)
+    for due in await get_due_demo_sessions(now):
+        session = await claim_demo_expiry(due["_id"])
+        if not session:
+            continue
+
+        for message_id in session.get("message_ids", []):
+            try:
+                await bot.delete_message(chat_id=session["user_id"], message_id=message_id)
+            except Exception:
+                logger.info("Demo message %s was already deleted or unavailable", message_id)
+
+        try:
+            replacement = await bot.send_message(
+                chat_id=session["user_id"],
+                text="🗑️ <b>Demo Videos Deleted</b>\n\nTap below to regenerate the demo videos 👇",
+                reply_markup=regenerate_demo_keyboard(session["_id"]),
+            )
+            await mark_demo_deleted(session["_id"], replacement.message_id)
+        except Exception:
+            logger.exception("Failed to send demo replacement for session %s", session["_id"])
+            await retry_demo_expiry(session["_id"], now + timedelta(seconds=30))

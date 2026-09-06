@@ -249,6 +249,14 @@ def plan_detail_keyboard(plan_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def regenerate_demo_keyboard(session_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Regenerate Demo", callback_data=f"demo_regenerate:{session_id}")],
+        ]
+    )
+
+
 # ── Payment flow ──────────────────────────────────────────────────────────────
 
 def payment_details_keyboard(order_id: str) -> InlineKeyboardMarkup:

@@ -15,6 +15,12 @@ from database import (
     schedule_start_reminders,
     cancel_start_reminders,
     has_any_approved_order,
+    create_demo_session,
+    activate_demo_session,
+    discard_demo_session,
+    claim_demo_regeneration,
+    complete_demo_regeneration,
+    fail_demo_regeneration,
 )
 from keyboards.menu import plans_list_keyboard, plan_detail_keyboard, main_menu_keyboard
 from handlers.log_channel import log_new_user, log_plan_selected
@@ -51,7 +57,26 @@ NO_PLANS_TEXT = (
 
 # ── Start demo video sender ───────────────────────────────────────────────────
 
-async def send_start_demo_videos(bot: Bot, chat_id: int) -> None:
+async def _copy_demo_messages(bot: Bot, chat_id: int, source: str, msg_ids: list[int]) -> list[int]:
+    sent_ids: list[int] = []
+    try:
+        copied = await bot.copy_messages(chat_id=chat_id, from_chat_id=source, message_ids=msg_ids)
+        sent_ids.extend(item.message_id for item in copied)
+        return sent_ids
+    except Exception:
+        logger.exception("copy_messages() failed — falling back to individual sends")
+
+    for message_id in msg_ids:
+        try:
+            copied = await bot.copy_message(chat_id=chat_id, from_chat_id=source, message_id=message_id)
+            sent_ids.append(copied.message_id)
+        except Exception:
+            logger.exception("Failed to copy message %s from channel %s", message_id, source)
+        await asyncio.sleep(0.25)
+    return sent_ids
+
+
+async def send_start_demo_videos(bot: Bot, chat_id: int, user_id: int) -> None:
     """
     Send the global start demo videos to the user on /start, if enabled.
     Reads message IDs and source channel from MongoDB — never downloads media.
@@ -64,35 +89,17 @@ async def send_start_demo_videos(bot: Bot, chat_id: int) -> None:
     source  = cfg["source"]
     msg_ids = cfg["ids"]
 
-    # Primary: batch copy as album
-    try:
-        await bot.copy_messages(
-            chat_id=chat_id,
-            from_chat_id=source,
-            message_ids=msg_ids,
-        )
-        return
-    except Exception:
-        logger.exception("copy_messages() failed for start demo — falling back to individual sends")
-
-    # Fallback: one-by-one
-    for message_id in msg_ids:
-        try:
-            await bot.copy_message(
-                chat_id=chat_id,
-                from_chat_id=source,
-                message_id=message_id,
-            )
-        except Exception:
-            logger.exception(
-                "Failed to copy start demo message %s from channel %s", message_id, source
-            )
-        await asyncio.sleep(0.25)
+    session_id = await create_demo_session(user_id, source, msg_ids)
+    sent_ids = await _copy_demo_messages(bot, chat_id, source, msg_ids)
+    if sent_ids:
+        await activate_demo_session(session_id, sent_ids, datetime.now(timezone.utc) + timedelta(minutes=10))
+    else:
+        await discard_demo_session(session_id)
 
 
 # ── Plan demo video sender ────────────────────────────────────────────────────
 
-async def send_demo_videos(bot: Bot, chat_id: int, plan: dict) -> None:
+async def send_demo_videos(bot: Bot, chat_id: int, user_id: int, plan: dict) -> tuple[str, list[int]] | None:
     """
     Copy demo messages from the plan's source channel to the user.
     Stores only message IDs — no media is downloaded locally.
@@ -104,30 +111,72 @@ async def send_demo_videos(bot: Bot, chat_id: int, plan: dict) -> None:
         logger.warning("Plan id=%s has no demo videos configured.", plan.get("id"))
         return
 
-    # Primary: batch copy as album
-    try:
-        await bot.copy_messages(
-            chat_id=chat_id,
-            from_chat_id=source,
-            message_ids=msg_ids,
-        )
-        return
-    except Exception:
-        logger.exception("copy_messages() failed — falling back to individual sends")
+    session_id = await create_demo_session(user_id, source, msg_ids, plan)
+    sent_ids = await _copy_demo_messages(bot, chat_id, source, msg_ids)
+    if sent_ids:
+        return session_id, sent_ids
+    await discard_demo_session(session_id)
+    return None
 
-    # Fallback: one-by-one
-    for message_id in msg_ids:
-        try:
-            await bot.copy_message(
-                chat_id=chat_id,
-                from_chat_id=source,
-                message_id=message_id,
+
+def _render_plan_text(plan: dict) -> str:
+    buy_tpl = plan.get("buy_message") or _DEFAULT_BUY_MESSAGE
+    try:
+        return buy_tpl.format(
+            plan_name=plan["name"],
+            plan_price=plan["price"],
+            plan_validity=plan["validity"],
+        )
+    except (KeyError, IndexError, ValueError):
+        logger.exception("Invalid placeholder in buy_message template")
+        return _DEFAULT_BUY_MESSAGE.format(
+            plan_name=plan["name"],
+            plan_price=plan["price"],
+            plan_validity=plan["validity"],
+        )
+
+
+async def _delete_tracked_message(bot: Bot, chat_id: int, message_id: int) -> None:
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        logger.info("Tracked demo message %s was already unavailable", message_id)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("demo_regenerate:"))
+async def callback_regenerate_demo(call: CallbackQuery, bot: Bot) -> None:
+    await call.answer()
+    session_id = call.data.split(":", 1)[1]
+    session = await claim_demo_regeneration(session_id, call.from_user.id)
+    if not session or not call.message:
+        return
+
+    await _delete_tracked_message(bot, call.message.chat.id, call.message.message_id)
+    try:
+        sent_ids = await _copy_demo_messages(
+            bot,
+            call.message.chat.id,
+            session["source"],
+            session["source_message_ids"],
+        )
+        plan = session.get("plan")
+        if plan and sent_ids:
+            plan_message = await call.message.answer(
+                _render_plan_text(plan),
+                reply_markup=plan_detail_keyboard(plan["id"]),
             )
-        except Exception:
-            logger.exception(
-                "Failed to copy message %s from channel %s", message_id, source
-            )
-        await asyncio.sleep(0.25)
+            sent_ids.append(plan_message.message_id)
+        if not sent_ids:
+            raise RuntimeError("No demo messages were regenerated")
+        await complete_demo_regeneration(
+            session_id,
+            sent_ids,
+            datetime.now(timezone.utc) + timedelta(minutes=10),
+        )
+    except Exception:
+        logger.exception("Failed to regenerate demo session %s", session_id)
+        await fail_demo_regeneration(session_id)
+        await call.message.answer("⚠️ Demo could not be regenerated. Please try again.")
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -193,7 +242,7 @@ async def cmd_start(message: Message, bot: Bot) -> None:
             logger.exception("Failed to schedule referral reminder for user %s", user.id)
 
     # Send start demo videos (if enabled by admin) — always, regardless of plans
-    await send_start_demo_videos(bot, message.chat.id)
+    await send_start_demo_videos(bot, message.chat.id, user.id)
 
     plans = await get_all_plans()
 
@@ -264,25 +313,18 @@ async def callback_plan(call: CallbackQuery, bot: Bot) -> None:
         price=f"₹{plan['price']} / {plan['validity']}",
     )
 
-    await send_demo_videos(bot, call.message.chat.id, plan)
-
-    buy_tpl = plan.get("buy_message") or _DEFAULT_BUY_MESSAGE
-    try:
-        plan_text = buy_tpl.format(
-            plan_name=plan["name"],
-            plan_price=plan["price"],
-            plan_validity=plan["validity"],
+    demo_result = await send_demo_videos(bot, call.message.chat.id, call.from_user.id, plan)
+    plan_message = await call.message.answer(
+        _render_plan_text(plan),
+        reply_markup=plan_detail_keyboard(plan_id),
+    )
+    if demo_result:
+        session_id, demo_ids = demo_result
+        await activate_demo_session(
+            session_id,
+            demo_ids + [plan_message.message_id],
+            datetime.now(timezone.utc) + timedelta(minutes=10),
         )
-    except (KeyError, IndexError, ValueError):
-        # Admin-entered template has an invalid placeholder — fall back safely
-        # rather than crashing the flow.
-        logger.exception("Invalid placeholder in buy_message template")
-        plan_text = _DEFAULT_BUY_MESSAGE.format(
-            plan_name=plan["name"],
-            plan_price=plan["price"],
-            plan_validity=plan["validity"],
-        )
-    await call.message.answer(plan_text, reply_markup=plan_detail_keyboard(plan_id))
 
     # Record plan interest: if the user never clicks Buy Now, a reminder fires
     # 30 minutes from now.  Viewing a different plan overwrites this safely.
