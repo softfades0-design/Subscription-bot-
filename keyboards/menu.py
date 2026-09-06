@@ -1,5 +1,16 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+
+def regenerate_payment_qr_keyboard(order_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🔄 Generate New QR",
+                callback_data=f"regenerate_payment_qr:{order_id}",
+            )],
+        ]
+    )
+
 # ── Admin panel ───────────────────────────────────────────────────────────────
 
 def admin_panel_keyboard() -> InlineKeyboardMarkup:

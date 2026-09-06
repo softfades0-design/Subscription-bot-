@@ -847,12 +847,101 @@ async def create_order(
     logger.debug("Created order %s for user %s", order_id, user_id)
 
 
-async def update_order_status(order_id: str, status: str) -> None:
-    await _orders.update_one({"_id": order_id}, {"$set": {"payment_status": status}})
-    logger.debug("Order %s → %s", order_id, status)
+async def update_order_status(order_id: str, status: str) -> bool:
+    """Apply a legal order transition without reviving terminal orders."""
+    if status not in {"pending", "expired", "failed", "cancelled", "rejected"}:
+        return False
+    current = await _orders.find_one(
+        {"_id": order_id}, {"payment_status": 1, "expires_at": 1}
+    )
+    if not current:
+        return False
+    old_status = current.get("payment_status", "created")
+    if old_status in {"expired", "approved"}:
+        return False
+    if status == "expired":
+        if old_status not in {"created", "pending"}:
+            return False
+    elif status == "pending":
+        expires_at = current.get("expires_at")
+        if expires_at and datetime.now(timezone.utc) >= expires_at:
+            await _orders.update_one(
+                {"_id": order_id, "payment_status": {"$in": ["created", "pending"]}},
+                {"$set": {"payment_status": "expired"}},
+            )
+            return False
+    elif old_status not in {"created", "pending"}:
+        return False
+    result = await _orders.update_one(
+        {"_id": order_id, "payment_status": old_status},
+        {"$set": {"payment_status": status}},
+    )
+    if result.modified_count:
+        logger.debug("Order %s → %s", order_id, status)
+    return result.modified_count == 1
 
 
-async def approve_order(order_id: str) -> dict | None:
+async def expire_due_orders(now: datetime | None = None) -> list[dict]:
+    """Atomically expire live orders and return their stored message IDs."""
+    now = now or datetime.now(timezone.utc)
+    cursor = _orders.find(
+        {
+            "payment_status": {"$in": ["created", "pending"]},
+            "expires_at": {"$lte": now},
+        },
+        {
+            "_id": 1,
+            "user_id": 1,
+            "plan_id": 1,
+            "qr_message_id": 1,
+            "payment_message_id": 1,
+        },
+    )
+    due = [doc async for doc in cursor]
+    expired = []
+    for doc in due:
+        result = await _orders.update_one(
+            {"_id": doc["_id"], "payment_status": {"$in": ["created", "pending"]}},
+            {"$set": {"payment_status": "expired"}},
+        )
+        if result.modified_count:
+            expired.append(doc)
+    return expired
+
+
+async def update_order_messages(
+    order_id: str,
+    user_id: int,
+    qr_message_id: int | None,
+    payment_message_id: int,
+) -> None:
+    await _orders.update_one(
+        {"_id": order_id, "user_id": user_id},
+        {"$set": {
+            "qr_message_id": qr_message_id,
+            "payment_message_id": payment_message_id,
+        }},
+    )
+
+
+async def get_active_order_for_user_plan(user_id: int, plan_id: int | None) -> dict | None:
+    """Return a non-expired in-progress order for this user's plan, if any."""
+    return await _orders.find_one(
+        {
+            "user_id": user_id,
+            "plan_id": plan_id,
+            "payment_status": {"$in": ["created", "pending"]},
+            "$or": [
+                {"expires_at": {"$gt": datetime.now(timezone.utc)}},
+                {"expires_at": {"$exists": False}},
+                {"expires_at": None},
+            ],
+        },
+        {"_id": 1, "expires_at": 1},
+    )
+
+
+async def approve_order(order_id: str, expected_user_id: int | None = None) -> dict | None:
     """
     Approve an order:
       - payment_status   → 'approved'
@@ -865,7 +954,15 @@ async def approve_order(order_id: str) -> dict | None:
     # Peek at plan_validity first so we know the subscription length; the actual
     # state transition below is atomic on (_id, payment_status='pending') so two
     # concurrent approvals of the same order can't both succeed.
-    peek = await _orders.find_one({"_id": order_id, "payment_status": "pending"})
+    now = datetime.now(timezone.utc)
+    query = {
+        "_id": order_id,
+        "payment_status": "pending",
+        "$or": [{"expires_at": None}, {"expires_at": {"$exists": False}}, {"expires_at": {"$gt": now}}],
+    }
+    if expected_user_id is not None:
+        query["user_id"] = expected_user_id
+    peek = await _orders.find_one(query)
     if not peek:
         return None
 
@@ -874,13 +971,12 @@ async def approve_order(order_id: str) -> dict | None:
     except (ValueError, IndexError):
         days = 30
 
-    now = datetime.now(timezone.utc)
     sub_end = now + timedelta(days=days)
 
     # Atomic compare-and-set: only succeeds if the order is still 'pending' at
     # the moment of the update, preventing a double-approve race.
     doc = await _orders.find_one_and_update(
-        {"_id": order_id, "payment_status": "pending"},
+        query,
         {"$set": {
             "payment_status":     "approved",
             "subscription_start": now.isoformat(),

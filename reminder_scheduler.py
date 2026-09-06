@@ -40,8 +40,15 @@ from database import (
     get_due_demo_sessions,
     claim_demo_expiry,
     complete_demo_deletion,
+    expire_due_orders,
+    cancel_reminder,
 )
-from keyboards.menu import reminder_buy_now_keyboard, referral_reminder_keyboard, plan_interest_reminder_keyboard
+from keyboards.menu import (
+    reminder_buy_now_keyboard,
+    referral_reminder_keyboard,
+    plan_interest_reminder_keyboard,
+    regenerate_payment_qr_keyboard,
+)
 from keyboards.menu import plans_list_keyboard
 
 logger = logging.getLogger(__name__)
@@ -97,6 +104,30 @@ async def run(bot: Bot) -> None:
 
 async def _tick(bot: Bot) -> None:
     await _tick_demo_sessions(bot)
+
+    # Expire payment orders independently of reminder settings. The database
+    # update is atomic, so an approval racing this sweep cannot win afterward.
+    for order in await expire_due_orders():
+        await cancel_reminder(order["user_id"], order["_id"])
+        for message_id in (order.get("qr_message_id"), order.get("payment_message_id")):
+            if not message_id:
+                continue
+            try:
+                await bot.delete_message(chat_id=order["user_id"], message_id=message_id)
+            except Exception:
+                logger.info("Expired payment message %s was already deleted or unavailable", message_id)
+        try:
+            await bot.send_message(
+                chat_id=order["user_id"],
+                text=(
+                    "⏰ Payment QR Expired\n\n"
+                    "Your payment session has expired.\n"
+                    "Please generate a new QR to continue your purchase."
+                ),
+                reply_markup=regenerate_payment_qr_keyboard(order["_id"]),
+            )
+        except Exception:
+            logger.warning("Failed to send expiry message for order %s", order["_id"])
 
     enabled = (await get_setting("reminder_enabled", "1")) == "1"
     if not enabled:

@@ -64,6 +64,8 @@ from database import (
     cancel_reminder,
     clear_plan_interest,
     cancel_start_reminders,
+    get_active_order_for_user_plan,
+    update_order_messages,
 )
 from keyboards.menu import (
     payment_details_keyboard,
@@ -96,7 +98,7 @@ _PRODUCT_TEXT = "Hello, {first_name} 👋\n\nChoose a plan to get started 💫"
 
 
 def _make_order_id() -> str:
-    return f"ORD{int(time.time())}"
+    return f"ORD{int(time.time() * 1000)}{secrets.token_hex(3).upper()}"
 
 
 def _format_amount(amount: str | Decimal) -> str:
@@ -329,7 +331,7 @@ def _parse_famapp_email(raw_message: bytes, message_id: str) -> dict | None:
     }
 
 
-async def _verify_payment_famapp(order_id: str, amount: str) -> str:
+async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: int | None = None) -> str:
     """Verify a FamApp order via Gmail IMAP using the same purpose+amount matching pattern as the upstream repo."""
     if not IMAP_USERNAME or not IMAP_APP_PASSWORD:
         logger.info(
@@ -365,7 +367,18 @@ async def _verify_payment_famapp(order_id: str, amount: str) -> str:
         )
         return "failed"
 
-    expected_amount = Decimal(str(amount or order.get("final_price") or order.get("plan_price") or "0")).quantize(Decimal("0.01"))
+    if expected_user_id is not None and order.get("user_id") != expected_user_id:
+        return "failed"
+    if order.get("payment_status") in {"expired", "approved", "cancelled", "failed", "rejected"}:
+        return "expired" if order.get("payment_status") == "expired" else "failed"
+
+    expected_amount = Decimal(str(order.get("final_price") or order.get("plan_price") or "0")).quantize(Decimal("0.01"))
+    try:
+        supplied_amount = Decimal(str(amount or "0")).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError):
+        return "failed"
+    if supplied_amount != expected_amount:
+        return "failed"
     expected_purpose = order.get("payment_purpose")
     payment_qr_upi_purpose = "<none>"
     stored_upi_uri = order.get("upi_uri") or ""
@@ -732,6 +745,7 @@ async def _send_payment_screen(
         "qr_msg_id": qr_msg_id,
         "payment_msg_id": pay_msg.message_id,
     }
+    await update_order_messages(order_id, user_id, qr_msg_id, pay_msg.message_id)
 
     # Schedule abandoned-payment reminders
     _MAX_REMINDER_DELAY_MIN = 525600  # 1 year
@@ -784,6 +798,7 @@ async def _send_manual_payment_screen(
     """
     # Create order — same retry logic as automatic flow
     order_id: str | None = None
+    manual_expires_at = datetime.now(timezone.utc) + timedelta(minutes=int(ORDER_EXPIRY_MINUTES or 15))
     for _ in range(5):
         candidate = _make_order_id()
         try:
@@ -797,6 +812,7 @@ async def _send_manual_payment_screen(
                 access_link=plan["access_link"],
                 final_price=final_price_str,
                 referral_discount_used=discount_pct,
+                expires_at=manual_expires_at,
             )
             order_id = candidate
             break
@@ -860,6 +876,7 @@ async def _send_manual_payment_screen(
         "payment_msg_id": pay_msg.message_id,
         "mode":           "manual",
     }
+    await update_order_messages(order_id, user_id, qr_msg_id, pay_msg.message_id)
 
     # Schedule abandoned-payment reminders (same as automatic flow)
     _MAX_REMINDER_DELAY_MIN = 525600
@@ -889,6 +906,43 @@ async def _send_manual_payment_screen(
 
 
 # ── Buy Now (buy:{plan_id}) ───────────────────────────────────────────────────
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("regenerate_payment_qr:"))
+async def callback_regenerate_payment_qr(call: CallbackQuery, bot: Bot) -> None:
+    """Regenerate a QR only from a verified, expired order owned by the user."""
+    try:
+        _, order_id = call.data.split(":", 1)
+    except (AttributeError, ValueError):
+        await call.answer("⚠️ Invalid payment regeneration request.", show_alert=True)
+        return
+
+    order = await get_order(order_id)
+    if not order or order.get("user_id") != call.from_user.id:
+        await call.answer("⚠️ This payment request is not available.", show_alert=True)
+        await call.message.edit_reply_markup(reply_markup=None)
+        return
+    if order.get("payment_status") != "expired":
+        await call.answer("⚠️ This payment request is no longer available.", show_alert=True)
+        await call.message.edit_reply_markup(reply_markup=None)
+        return
+    plan_id = order.get("plan_id")
+    if plan_id is None:
+        await call.answer("⚠️ This payment request cannot be regenerated.", show_alert=True)
+        await call.message.edit_reply_markup(reply_markup=None)
+        return
+
+    # Reuse callback_buy so regeneration gets the same lock, temporary status,
+    # plan checks, payment mode, pricing, QR creation, and cleanup behavior.
+    try:
+        await call.message.delete()
+    except Exception:
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    call.data = f"buy:{plan_id}"
+    await callback_buy(call, bot)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("buy:"))
@@ -960,6 +1014,12 @@ async def callback_buy(call: CallbackQuery, bot: Bot) -> None:
             f"🎁 <b>Referral Discount:</b> {discount_pct}%\n"
             f"💳 <b>Final Price:</b> ₹{final_price_str}"
         )
+
+        # Repeated clicks while an order is still live must not create a
+        # second payable order. Expired orders are excluded and can be replaced.
+        if await get_active_order_for_user_plan(user.id, plan_id):
+            await call.answer("⏳ You already have a payment in progress.", show_alert=False)
+            return
 
         # Route to manual or automatic payment screen based on current setting
         payment_mode = (await get_setting("payment_mode", "automatic")) or "automatic"
@@ -1035,12 +1095,14 @@ async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
         "⏳ <b>Verifying your payment...</b>\n\nPlease wait a moment."
     )
 
-    status = await _verify_payment_famapp(order_id, final_price)
+    status = await _verify_payment_famapp(order_id, final_price, expected_user_id=user.id)
 
     if status == "success":
-        # Set to pending first (approve_order requires pending status)
-        await update_order_status(order_id, "pending")
-        result = await approve_order(order_id)
+        order = await get_order(order_id)
+        marked_pending = bool(order and order.get("user_id") == user.id)
+        if marked_pending:
+            marked_pending = await update_order_status(order_id, "pending")
+        result = await approve_order(order_id, expected_user_id=user.id) if marked_pending else None
         _awaiting_proof.pop(user.id, None)
 
         if result:
@@ -1085,6 +1147,13 @@ async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
         await verifying_msg.edit_text(
             "⏳ Payment not received yet. Please wait a moment and try again.",
             reply_markup=payment_details_keyboard(order_id),
+        )
+
+    elif status == "expired":
+        await update_order_status(order_id, "expired")
+        await verifying_msg.edit_text(
+            "⌛ <b>This payment session has expired.</b>\n\n"
+            "Please tap <b>Buy Now</b> to generate a fresh payment QR."
         )
 
     else:
@@ -1135,7 +1204,7 @@ async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
 
         # Mark old order as failed and cancel its reminder
         try:
-            await update_order_status(order_id, "failed")
+            await update_order_status(order_id, "expired" if status == "expired" else "failed")
         except Exception:
             logger.exception("Failed to mark old order %s as failed", order_id)
         try:
@@ -1213,9 +1282,14 @@ async def handle_proof_photo(message: Message, bot: Bot) -> None:
     if not order:
         await message.answer("⚠️ Order not found. Please contact support.")
         return
+    if order.get("user_id") != user.id or order.get("payment_status") == "expired":
+        await message.answer("⚠️ This payment order has expired. Please start a new payment.")
+        return
 
     # Mark order as pending (awaiting manual review)
-    await update_order_status(order_id, "pending")
+    if not await update_order_status(order_id, "pending"):
+        await message.answer("⚠️ This payment order is no longer available. Please start a new payment.")
+        return
 
     # Build review caption
     uname  = f"@{html.escape(user.username)}" if user.username else "—"
@@ -1277,7 +1351,7 @@ async def callback_manual_approve(call: CallbackQuery, bot: Bot) -> None:
         return
 
     # approve_order requires pending status (already set when screenshot was received)
-    result = await approve_order(order_id)
+    result = await approve_order(order_id, expected_user_id=user_id)
     if not result:
         try:
             await call.message.edit_caption(
