@@ -39,10 +39,9 @@ from database import (
     get_all_plans,
     get_due_demo_sessions,
     claim_demo_expiry,
-    mark_demo_deleted,
-    retry_demo_expiry,
+    complete_demo_deletion,
 )
-from keyboards.menu import reminder_buy_now_keyboard, referral_reminder_keyboard, plan_interest_reminder_keyboard, regenerate_demo_keyboard
+from keyboards.menu import reminder_buy_now_keyboard, referral_reminder_keyboard, plan_interest_reminder_keyboard
 from keyboards.menu import plans_list_keyboard
 
 logger = logging.getLogger(__name__)
@@ -232,13 +231,4 @@ async def _tick_demo_sessions(bot: Bot) -> None:
             except Exception:
                 logger.info("Demo message %s was already deleted or unavailable", message_id)
 
-        try:
-            replacement = await bot.send_message(
-                chat_id=session["user_id"],
-                text="🗑️ <b>Demo Videos Deleted</b>\n\nTap below to regenerate the demo videos 👇",
-                reply_markup=regenerate_demo_keyboard(session["_id"]),
-            )
-            await mark_demo_deleted(session["_id"], replacement.message_id)
-        except Exception:
-            logger.exception("Failed to send demo replacement for session %s", session["_id"])
-            await retry_demo_expiry(session["_id"], now + timedelta(seconds=30))
+        await complete_demo_deletion(session["_id"])

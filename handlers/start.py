@@ -18,9 +18,6 @@ from database import (
     create_demo_session,
     activate_demo_session,
     discard_demo_session,
-    claim_demo_regeneration,
-    complete_demo_regeneration,
-    fail_demo_regeneration,
 )
 from keyboards.menu import plans_list_keyboard, plan_detail_keyboard, main_menu_keyboard
 from handlers.log_channel import log_new_user, log_plan_selected
@@ -89,7 +86,7 @@ async def send_start_demo_videos(bot: Bot, chat_id: int, user_id: int) -> None:
     source  = cfg["source"]
     msg_ids = cfg["ids"]
 
-    session_id = await create_demo_session(user_id, source, msg_ids)
+    session_id = await create_demo_session(user_id)
     sent_ids = await _copy_demo_messages(bot, chat_id, source, msg_ids)
     if sent_ids:
         await activate_demo_session(session_id, sent_ids, datetime.now(timezone.utc) + timedelta(minutes=10))
@@ -111,7 +108,7 @@ async def send_demo_videos(bot: Bot, chat_id: int, user_id: int, plan: dict) -> 
         logger.warning("Plan id=%s has no demo videos configured.", plan.get("id"))
         return
 
-    session_id = await create_demo_session(user_id, source, msg_ids, plan)
+    session_id = await create_demo_session(user_id)
     sent_ids = await _copy_demo_messages(bot, chat_id, source, msg_ids)
     if sent_ids:
         return session_id, sent_ids
@@ -134,49 +131,6 @@ def _render_plan_text(plan: dict) -> str:
             plan_price=plan["price"],
             plan_validity=plan["validity"],
         )
-
-
-async def _delete_tracked_message(bot: Bot, chat_id: int, message_id: int) -> None:
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception:
-        logger.info("Tracked demo message %s was already unavailable", message_id)
-
-
-@router.callback_query(lambda c: c.data and c.data.startswith("demo_regenerate:"))
-async def callback_regenerate_demo(call: CallbackQuery, bot: Bot) -> None:
-    await call.answer()
-    session_id = call.data.split(":", 1)[1]
-    session = await claim_demo_regeneration(session_id, call.from_user.id)
-    if not session or not call.message:
-        return
-
-    await _delete_tracked_message(bot, call.message.chat.id, call.message.message_id)
-    try:
-        sent_ids = await _copy_demo_messages(
-            bot,
-            call.message.chat.id,
-            session["source"],
-            session["source_message_ids"],
-        )
-        plan = session.get("plan")
-        if plan and sent_ids:
-            plan_message = await call.message.answer(
-                _render_plan_text(plan),
-                reply_markup=plan_detail_keyboard(plan["id"]),
-            )
-            sent_ids.append(plan_message.message_id)
-        if not sent_ids:
-            raise RuntimeError("No demo messages were regenerated")
-        await complete_demo_regeneration(
-            session_id,
-            sent_ids,
-            datetime.now(timezone.utc) + timedelta(minutes=10),
-        )
-    except Exception:
-        logger.exception("Failed to regenerate demo session %s", session_id)
-        await fail_demo_regeneration(session_id)
-        await call.message.answer("⚠️ Demo could not be regenerated. Please try again.")
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -314,7 +268,7 @@ async def callback_plan(call: CallbackQuery, bot: Bot) -> None:
     )
 
     demo_result = await send_demo_videos(bot, call.message.chat.id, call.from_user.id, plan)
-    plan_message = await call.message.answer(
+    await call.message.answer(
         _render_plan_text(plan),
         reply_markup=plan_detail_keyboard(plan_id),
     )
@@ -322,7 +276,7 @@ async def callback_plan(call: CallbackQuery, bot: Bot) -> None:
         session_id, demo_ids = demo_result
         await activate_demo_session(
             session_id,
-            demo_ids + [plan_message.message_id],
+            demo_ids,
             datetime.now(timezone.utc) + timedelta(minutes=10),
         )
 

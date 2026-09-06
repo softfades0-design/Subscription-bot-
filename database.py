@@ -1032,22 +1032,15 @@ async def get_all_settings() -> dict[str, str]:
 
 async def create_demo_session(
     user_id: int,
-    source: str,
-    source_message_ids: list[int],
-    plan: dict | None = None,
 ) -> str:
-    """Persist one user's demo source/config so it can be regenerated safely."""
+    """Create a per-user session for tracking sent demo message IDs."""
     import secrets
 
     session_id = secrets.token_urlsafe(8)
     await _demo_sessions.insert_one({
         "_id": session_id,
         "user_id": user_id,
-        "source": source,
-        "source_message_ids": list(source_message_ids),
-        "plan": plan,
         "message_ids": [],
-        "replacement_message_id": None,
         "status": "sending",
         "updated_at": datetime.now(timezone.utc),
     })
@@ -1070,10 +1063,6 @@ async def discard_demo_session(session_id: str) -> None:
     await _demo_sessions.delete_one({"_id": session_id})
 
 
-async def get_demo_session(session_id: str, user_id: int) -> dict | None:
-    return await _demo_sessions.find_one({"_id": session_id, "user_id": user_id})
-
-
 async def get_due_demo_sessions(now: datetime) -> list[dict]:
     cursor = _demo_sessions.find({"status": "active", "expires_at": {"$lte": now}})
     return [doc async for doc in cursor]
@@ -1086,49 +1075,14 @@ async def claim_demo_expiry(session_id: str) -> dict | None:
     )
 
 
-async def retry_demo_expiry(session_id: str, retry_at: datetime) -> None:
-    await _demo_sessions.update_one(
-        {"_id": session_id, "status": "deleting"},
-        {"$set": {"status": "active", "expires_at": retry_at, "updated_at": datetime.now(timezone.utc)}},
-    )
-
-
-async def mark_demo_deleted(session_id: str, replacement_message_id: int) -> None:
+async def complete_demo_deletion(session_id: str) -> None:
     await _demo_sessions.update_one(
         {"_id": session_id},
         {"$set": {
             "message_ids": [],
-            "replacement_message_id": replacement_message_id,
             "status": "deleted",
             "updated_at": datetime.now(timezone.utc),
         }},
-    )
-
-
-async def claim_demo_regeneration(session_id: str, user_id: int) -> dict | None:
-    return await _demo_sessions.find_one_and_update(
-        {"_id": session_id, "user_id": user_id, "status": "deleted"},
-        {"$set": {"status": "regenerating", "updated_at": datetime.now(timezone.utc)}},
-    )
-
-
-async def complete_demo_regeneration(session_id: str, message_ids: list[int], expires_at: datetime) -> None:
-    await _demo_sessions.update_one(
-        {"_id": session_id},
-        {"$set": {
-            "message_ids": list(message_ids),
-            "replacement_message_id": None,
-            "expires_at": expires_at,
-            "status": "active",
-            "updated_at": datetime.now(timezone.utc),
-        }},
-    )
-
-
-async def fail_demo_regeneration(session_id: str) -> None:
-    await _demo_sessions.update_one(
-        {"_id": session_id, "status": "regenerating"},
-        {"$set": {"status": "deleted", "updated_at": datetime.now(timezone.utc)}},
     )
 
 
