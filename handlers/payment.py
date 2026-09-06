@@ -10,6 +10,7 @@ Sequence:
   3. cancel callbacks     → cancel the order and return to the main menu
 """
 
+import asyncio
 import email
 import html
 import imaplib
@@ -84,6 +85,9 @@ _awaiting_proof: dict[int, dict] = {}
 
 # user_id -> order_id  (set when user taps Upload Screenshot, cleared after photo received)
 _waiting_proof: dict[int, str] = {}
+
+# (user_id, plan_id) -> lock for an in-progress Buy Now flow
+_payment_generation_locks: dict[tuple[int, int], asyncio.Lock] = {}
 
 _PRODUCT_TEXT = "Hello, {first_name} 👋\n\nChoose a plan to get started 💫"
 
@@ -900,79 +904,97 @@ async def callback_buy(call: CallbackQuery, bot: Bot) -> None:
         await call.message.answer("⚠️ Invalid plan. Please try again.")
         return
 
-    plan = await get_plan(plan_id)
-    if not plan:
-        await call.message.answer("⚠️ Plan not found. It may have been removed.")
-        return
-
     user = call.from_user
-
-    await cancel_start_reminders(user.id)
-
-    # Block repurchase of an already-active plan (approved + not yet expired).
-    if await user_has_active_plan(user.id, plan_id):
-        await call.message.answer(
-            "✅ <b>You have already purchased this plan.</b>\n\n"
-            "Thank you for your purchase! ❤️\n\n"
-            "You already have access to this plan."
-        )
+    lock_key = (user.id, plan_id)
+    flow_lock = _payment_generation_locks.setdefault(lock_key, asyncio.Lock())
+    if flow_lock.locked():
+        await call.answer("⏳ Generating Payment QR...", show_alert=False)
         return
 
-    await log_payment_started(bot, user.id, user.first_name, plan_title=plan["name"])
-
-    # User clicked Buy Now — suppress any pending plan-interest reminder.
+    await flow_lock.acquire()
+    generating_msg = None
     try:
-        await clear_plan_interest(user.id)
-    except Exception:
-        logger.exception("Failed to clear plan interest for user %s", user.id)
+        generating_msg = await call.message.answer("⏳ Generating Payment QR...")
 
-    # Referral discount
-    referral_info = await get_user_referral_info(user.id)
-    discount_pct = referral_info.get("referral_discount", 0) or 0
-    original_price_str = plan["price"]
+        plan = await get_plan(plan_id)
+        if not plan:
+            await call.message.answer("⚠️ Plan not found. It may have been removed.")
+            return
 
-    if discount_pct > 0:
+        await cancel_start_reminders(user.id)
+
+        # Block repurchase of an already-active plan (approved + not yet expired).
+        if await user_has_active_plan(user.id, plan_id):
+            await call.message.answer(
+                "✅ <b>You have already purchased this plan.</b>\n\n"
+                "Thank you for your purchase! ❤️\n\n"
+                "You already have access to this plan."
+            )
+            return
+
+        await log_payment_started(bot, user.id, user.first_name, plan_title=plan["name"])
+
+        # User clicked Buy Now — suppress any pending plan-interest reminder.
         try:
-            final_price = round(float(original_price_str) * (1 - discount_pct / 100))
-            final_price_str = str(final_price)
-        except (ValueError, TypeError):
+            await clear_plan_interest(user.id)
+        except Exception:
+            logger.exception("Failed to clear plan interest for user %s", user.id)
+
+        # Referral discount
+        referral_info = await get_user_referral_info(user.id)
+        discount_pct = referral_info.get("referral_discount", 0) or 0
+        original_price_str = plan["price"]
+
+        if discount_pct > 0:
+            try:
+                final_price = round(float(original_price_str) * (1 - discount_pct / 100))
+                final_price_str = str(final_price)
+            except (ValueError, TypeError):
+                final_price_str = original_price_str
+        else:
+            discount_pct = 0
             final_price_str = original_price_str
-    else:
-        discount_pct = 0
-        final_price_str = original_price_str
 
-    price_section = (
-        f"💰 <b>Original Price:</b> ₹{original_price_str}\n"
-        f"🎁 <b>Referral Discount:</b> {discount_pct}%\n"
-        f"💳 <b>Final Price:</b> ₹{final_price_str}"
-    )
-
-    # Route to manual or automatic payment screen based on current setting
-    payment_mode = (await get_setting("payment_mode", "automatic")) or "automatic"
-
-    if payment_mode == "manual":
-        await _send_manual_payment_screen(
-            bot=bot,
-            chat_id=call.message.chat.id,
-            user_id=user.id,
-            plan=plan,
-            plan_id=plan_id,
-            final_price_str=final_price_str,
-            price_section=price_section,
-            discount_pct=discount_pct,
-        )
-    else:
-        await _send_payment_screen(
-            bot=bot,
-            chat_id=call.message.chat.id,
-            user_id=user.id,
-            plan=plan,
-            plan_id=plan_id,
-            final_price_str=final_price_str,
-            price_section=price_section,
-            discount_pct=discount_pct,
+        price_section = (
+            f"💰 <b>Original Price:</b> ₹{original_price_str}\n"
+            f"🎁 <b>Referral Discount:</b> {discount_pct}%\n"
+            f"💳 <b>Final Price:</b> ₹{final_price_str}"
         )
 
+        # Route to manual or automatic payment screen based on current setting
+        payment_mode = (await get_setting("payment_mode", "automatic")) or "automatic"
+
+        if payment_mode == "manual":
+            await _send_manual_payment_screen(
+                bot=bot,
+                chat_id=call.message.chat.id,
+                user_id=user.id,
+                plan=plan,
+                plan_id=plan_id,
+                final_price_str=final_price_str,
+                price_section=price_section,
+                discount_pct=discount_pct,
+            )
+        else:
+            await _send_payment_screen(
+                bot=bot,
+                chat_id=call.message.chat.id,
+                user_id=user.id,
+                plan=plan,
+                plan_id=plan_id,
+                final_price_str=final_price_str,
+                price_section=price_section,
+                discount_pct=discount_pct,
+            )
+    finally:
+        if generating_msg is not None:
+            try:
+                await generating_msg.delete()
+            except Exception:
+                logger.debug("Failed to delete payment generation message", exc_info=True)
+        flow_lock.release()
+        if _payment_generation_locks.get(lock_key) is flow_lock:
+            _payment_generation_locks.pop(lock_key, None)
 
 # ── I Have Paid → automatic FamApp verification ──────────────────────────────
 
