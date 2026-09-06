@@ -925,7 +925,7 @@ async def update_order_messages(
 
 
 async def get_active_order_for_user_plan(user_id: int, plan_id: int | None) -> dict | None:
-    """Return a non-expired in-progress order for this user's plan, if any."""
+    """Return a non-expired in-progress order for this exact user and plan."""
     return await _orders.find_one(
         {
             "user_id": user_id,
@@ -937,7 +937,25 @@ async def get_active_order_for_user_plan(user_id: int, plan_id: int | None) -> d
                 {"expires_at": None},
             ],
         },
-        {"_id": 1, "expires_at": 1},
+        {
+            "_id": 1,
+            "user_id": 1,
+            "plan_id": 1,
+            "plan_name": 1,
+            "plan_price": 1,
+            "final_price": 1,
+            "plan_validity": 1,
+            "access_link": 1,
+            "payment_status": 1,
+            "payment_purpose": 1,
+            "upi_uri": 1,
+            "payee_name": 1,
+            "qr_image": 1,
+            "expires_at": 1,
+            "qr_message_id": 1,
+            "payment_message_id": 1,
+            "referral_discount_used": 1,
+        },
     )
 
 

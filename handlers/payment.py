@@ -795,6 +795,156 @@ async def _send_payment_screen(
     return order_id
 
 
+async def _restore_existing_payment_screen(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    plan: dict,
+    order: dict,
+    price_section: str,
+) -> bool:
+    """Restore a live order's payment screen without creating another order."""
+    order_id = order["_id"]
+    final_price_str = str(order.get("final_price") or order.get("plan_price") or plan["price"])
+
+    stored_qr_id = order.get("qr_message_id")
+    stored_payment_id = order.get("payment_message_id")
+    if stored_qr_id and stored_payment_id:
+        copied_qr_id = None
+        try:
+            copied_qr = await bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=chat_id,
+                message_id=stored_qr_id,
+            )
+            copied_qr_id = copied_qr.message_id
+            copied_payment = await bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=chat_id,
+                message_id=stored_payment_id,
+            )
+            await update_order_messages(order_id, user_id, copied_qr_id, copied_payment.message_id)
+            _awaiting_proof[user_id] = {
+                "order_id": order_id,
+                "plan_id": order.get("plan_id"),
+                "plan_name": plan["name"],
+                "plan_price": plan["price"],
+                "final_price": final_price_str,
+                "plan_validity": plan["validity"],
+                "access_link": plan["access_link"],
+                "price_section": price_section,
+                "discount_pct": order.get("referral_discount_used", 0),
+                "qr_msg_id": copied_qr_id,
+                "payment_msg_id": copied_payment.message_id,
+            }
+            logger.info(
+                "EXISTING PAYMENT MESSAGES REUSED order_id=%s qr_message_id=%s payment_message_id=%s",
+                order_id,
+                copied_qr_id,
+                copied_payment.message_id,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "EXISTING PAYMENT MESSAGE REUSE FAILED order_id=%s exception_type=%s exception=%s; rebuilding",
+                order_id,
+                type(exc).__name__,
+                str(exc),
+            )
+            if copied_qr_id:
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=copied_qr_id)
+                except Exception:
+                    logger.exception("Failed to clean up copied QR order_id=%s", order_id)
+
+    qr_bytes = order.get("qr_image")
+    if not qr_bytes and order.get("payment_purpose"):
+        qr_bytes = _generate_famapp_qr_bytes(final_price_str, order["payment_purpose"])
+
+    payment_tpl = await get_setting("payment_message")
+    default_tpl = (
+        "💳 <b>Payment Details</b>\n\n"
+        "📦 <b>Plan:</b> {plan_name}\n"
+        "{price_section}\n"
+        "⌛ <b>Validity:</b> {plan_validity}\n\n"
+        "📲 Scan the QR code above using any UPI app.\n\n"
+        "✅ <b>Pay ₹{final_price_str}</b> by scanning the <b>QR Code</b> above.\n"
+        "✅ After paying, tap <b>Check Payment Status</b> — your plan unlocks instantly once the payment is confirmed.\n\n"
+        "🆔 <b>Order:</b> #{order_id}"
+    )
+    template = payment_tpl or default_tpl
+    format_args = {
+        "plan_name": plan["name"],
+        "plan_price": plan["price"],
+        "plan_validity": plan["validity"],
+        "order_id": order_id,
+        "price_section": price_section,
+        "final_price_str": final_price_str,
+    }
+    try:
+        payment_text = template.format(**format_args)
+    except (KeyError, ValueError, IndexError):
+        payment_text = default_tpl.format(**format_args)
+
+    qr_message_id = None
+    if qr_bytes:
+        qr_data = BytesIO(qr_bytes)
+        qr_data.name = f"{order_id}.png"
+        qr_msg = await bot.send_photo(
+            chat_id=chat_id,
+            photo=BufferedInputFile(qr_data.getvalue(), filename=qr_data.name),
+        )
+        qr_message_id = qr_msg.message_id
+    elif order.get("payment_status") == "created":
+        manual_qr = (await get_setting("manual_payment_qr", "")) or ""
+        if manual_qr:
+            qr_msg = await bot.send_photo(chat_id=chat_id, photo=manual_qr)
+            qr_message_id = qr_msg.message_id
+
+    if not qr_message_id and order.get("payment_purpose"):
+        raise RuntimeError("active automatic order has no usable QR data")
+
+    payment_keyboard = (
+        payment_details_keyboard(order_id)
+        if order.get("payment_purpose")
+        else manual_payment_keyboard(order_id)
+    )
+    try:
+        payment_msg = await bot.send_message(
+            chat_id,
+            payment_text,
+            reply_markup=payment_keyboard,
+        )
+    except Exception:
+        if qr_message_id:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=qr_message_id)
+            except Exception:
+                logger.exception("Failed to clean up restored QR order_id=%s", order_id)
+        raise
+    await update_order_messages(order_id, user_id, qr_message_id, payment_msg.message_id)
+    _awaiting_proof[user_id] = {
+        "order_id": order_id,
+        "plan_id": order.get("plan_id"),
+        "plan_name": plan["name"],
+        "plan_price": plan["price"],
+        "final_price": final_price_str,
+        "plan_validity": plan["validity"],
+        "access_link": plan["access_link"],
+        "price_section": price_section,
+        "discount_pct": order.get("referral_discount_used", 0),
+        "qr_msg_id": qr_message_id,
+        "payment_msg_id": payment_msg.message_id,
+    }
+    logger.info(
+        "EXISTING PAYMENT SCREEN RESTORED order_id=%s qr_message_id=%s payment_message_id=%s",
+        order_id,
+        qr_message_id,
+        payment_msg.message_id,
+    )
+    return True
+
+
 # ── Manual payment screen (no VC QR) ─────────────────────────────────────────
 
 
@@ -988,6 +1138,7 @@ async def callback_buy(
     lock_key = (user.id, plan_id)
     flow_lock = _payment_generation_locks.setdefault(lock_key, asyncio.Lock())
     if flow_lock.locked():
+        logger.info("BUY CALLBACK RETURN: generation already in progress user_id=%s plan_id=%s", user.id, plan_id)
         await call.answer("⏳ Generating Payment QR...", show_alert=False)
         return
 
@@ -1002,6 +1153,7 @@ async def callback_buy(
         if not plan:
             logger.error("PLAN RESOLUTION FAILED user_id=%s plan_id=%s", user.id, plan_id)
             await call.message.answer("⚠️ Plan not found. It may have been removed.")
+            logger.info("BUY CALLBACK RETURN: plan not found user_id=%s plan_id=%s", user.id, plan_id)
             return
         logger.info("PLAN RESOLVED user_id=%s plan_id=%s plan_name=%s", user.id, plan_id, plan["name"])
 
@@ -1014,6 +1166,7 @@ async def callback_buy(
                 "Thank you for your purchase! ❤️\n\n"
                 "You already have access to this plan."
             )
+            logger.info("BUY CALLBACK RETURN: subscription already active user_id=%s plan_id=%s", user.id, plan_id)
             return
 
         await log_payment_started(bot, user.id, user.first_name, plan_title=plan["name"])
@@ -1045,12 +1198,47 @@ async def callback_buy(
             f"💳 <b>Final Price:</b> ₹{final_price_str}"
         )
 
-        # Repeated clicks while an order is still live must not create a
-        # second payable order. Expired orders are excluded and can be replaced.
-        if await get_active_order_for_user_plan(user.id, plan_id):
-            logger.info("ACTIVE PAYMENT ORDER EXISTS user_id=%s plan_id=%s", user.id, plan_id)
-            await call.answer("⏳ You already have a payment in progress.", show_alert=False)
-            return
+        # Repeated clicks must not create a second payable order. Restore the
+        # existing order's screen instead; the lookup excludes expired orders.
+        active_order = await get_active_order_for_user_plan(user.id, plan_id)
+        if active_order:
+            existing_order_id = active_order["_id"]
+            logger.info(
+                "ACTIVE PAYMENT ORDER EXISTS user_id=%s plan_id=%s order_id=%s status=%s expires_at=%s "
+                "stored_qr_message_id=%s stored_payment_message_id=%s qr_data=%s",
+                user.id,
+                plan_id,
+                existing_order_id,
+                active_order.get("payment_status"),
+                active_order.get("expires_at"),
+                active_order.get("qr_message_id"),
+                active_order.get("payment_message_id"),
+                bool(active_order.get("qr_image") or active_order.get("payment_purpose")),
+            )
+            try:
+                restored = await _restore_existing_payment_screen(
+                    bot=bot,
+                    chat_id=call.message.chat.id,
+                    user_id=user.id,
+                    plan=plan,
+                    order=active_order,
+                    price_section=price_section,
+                )
+                if restored:
+                    generation_succeeded = True
+                    logger.info("BUY CALLBACK RETURN: existing active order reused order_id=%s", existing_order_id)
+                    return
+            except Exception as exc:
+                logger.exception(
+                    "ACTIVE PAYMENT SCREEN RESTORE FAILED order_id=%s exception_type=%s exception=%s",
+                    existing_order_id,
+                    type(exc).__name__,
+                    str(exc),
+                )
+            # The old pending order cannot present a usable payment screen.
+            # Make it terminal before creating exactly one fresh order.
+            await update_order_status(existing_order_id, "failed")
+            logger.warning("ACTIVE PAYMENT ORDER MARKED FAILED order_id=%s; creating fresh order", existing_order_id)
 
         # Route to manual or automatic payment screen based on current setting
         payment_mode = (await get_setting("payment_mode", "automatic")) or "automatic"
@@ -1081,6 +1269,7 @@ async def callback_buy(
             raise RuntimeError("payment screen creation returned no order ID")
         generation_succeeded = True
         logger.info("BUY PAYMENT SCREEN READY user_id=%s plan_id=%s order_id=%s", user.id, plan_id, new_order_id)
+        logger.info("BUY CALLBACK RETURN: fresh order created order_id=%s", new_order_id)
     except Exception as exc:
         logger.exception(
             "BUY FLOW FAILED user_id=%s plan_id=%s exception_type=%s exception=%s",
