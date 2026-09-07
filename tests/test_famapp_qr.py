@@ -110,6 +110,38 @@ class FamAppQrTests(unittest.TestCase):
         self.assertIn("purpose_match=True", messages)
         self.assertIn("final_match=True", messages)
 
+    def test_manual_screenshot_submission_reaches_review(self):
+        user = type("User", (), {"id": 7, "username": "buyer"})()
+        message = type("Message", (), {})()
+        message.from_user = user
+        message.photo = [type("Photo", (), {"file_id": "proof-file"})()]
+        message.answer = AsyncMock()
+        bot = AsyncMock()
+        order = {
+            "order_id": "ORD-MANUAL-1",
+            "user_id": user.id,
+            "plan_name": "Gold",
+            "plan_price": "199",
+            "final_price": "199",
+            "payment_status": "created",
+        }
+
+        async def submit_proof():
+            payment._waiting_proof[user.id] = order["order_id"]
+            with (
+                patch.object(payment, "get_order", new=AsyncMock(return_value=order)),
+                patch.object(payment, "update_order_status", new=AsyncMock(return_value=True)) as update_status,
+                patch.object(payment, "LOG_CHANNEL_ID", 999),
+            ):
+                bot.send_photo = AsyncMock()
+                await payment.handle_proof_photo(message, bot)
+            return update_status
+
+        update_status = asyncio.run(submit_proof())
+        update_status.assert_awaited_once_with(order["order_id"], "pending")
+        bot.send_photo.assert_awaited_once()
+        message.answer.assert_awaited_once()
+
     def test_generated_purpose_flows_through_qr_and_verification(self):
         amount = "1.00"
         purpose = payment._generate_famapp_purpose()

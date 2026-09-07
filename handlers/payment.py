@@ -351,6 +351,7 @@ async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: i
 
     order = await get_order(order_id)
     if not order:
+        logger.warning("FamApp verification rejected order_id=%s reason=order_not_found", order_id)
         logger.info(
             "FamApp verification order_id=%s expected_amount=%s "
             "expected_payment_purpose=%s imap_connection=%s "
@@ -368,16 +369,34 @@ async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: i
         return "failed"
 
     if expected_user_id is not None and order.get("user_id") != expected_user_id:
+        logger.warning(
+            "FamApp verification rejected order_id=%s reason=user_mismatch expected_user_id=%s actual_user_id=%s",
+            order_id,
+            expected_user_id,
+            order.get("user_id"),
+        )
         return "failed"
     if order.get("payment_status") in {"expired", "approved", "cancelled", "failed", "rejected"}:
+        logger.warning(
+            "FamApp verification rejected order_id=%s reason=terminal_status status=%s",
+            order_id,
+            order.get("payment_status"),
+        )
         return "expired" if order.get("payment_status") == "expired" else "failed"
 
     expected_amount = Decimal(str(order.get("final_price") or order.get("plan_price") or "0")).quantize(Decimal("0.01"))
     try:
         supplied_amount = Decimal(str(amount or "0")).quantize(Decimal("0.01"))
     except (InvalidOperation, ValueError):
+        logger.warning("FamApp verification rejected order_id=%s reason=invalid_supplied_amount amount=%r", order_id, amount)
         return "failed"
     if supplied_amount != expected_amount:
+        logger.warning(
+            "FamApp verification rejected order_id=%s reason=amount_mismatch expected=%s supplied=%s",
+            order_id,
+            expected_amount,
+            supplied_amount,
+        )
         return "failed"
     expected_purpose = order.get("payment_purpose")
     payment_qr_upi_purpose = "<none>"
@@ -417,6 +436,11 @@ async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: i
             0,
             False,
             expiry_status,
+        )
+        logger.warning(
+            "FamApp verification rejected order_id=%s reason=expired expires_at=%s",
+            order_id,
+            expiry.isoformat(),
         )
         return "expired"
 
@@ -501,6 +525,12 @@ async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: i
             expiry_status,
         )
         if not message_ids:
+            logger.warning(
+                "FamApp verification pending order_id=%s reason=no_candidate_emails expected_purpose=%s expected_amount=%s",
+                order_id,
+                expected_purpose,
+                expected_amount,
+            )
             imap_client.close()
             imap_client.logout()
             return "pending"
@@ -606,8 +636,21 @@ async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: i
                     return "success"
         imap_client.close()
         imap_client.logout()
+        logger.warning(
+            "FamApp verification pending order_id=%s reason=no_matching_email candidate_email_count=%d expected_purpose=%s expected_amount=%s",
+            order_id,
+            candidate_email_count,
+            expected_purpose,
+            expected_amount,
+        )
         return "pending"
-    except Exception:
+    except Exception as exc:
+        logger.exception(
+            "FamApp verification failed order_id=%s reason=provider_exception exception_type=%s exception=%s",
+            order_id,
+            type(exc).__name__,
+            str(exc),
+        )
         logger.info(
             "FamApp verification order_id=%s expected_amount=%s "
             "expected_payment_purpose=%s imap_connection=failure "
@@ -1294,13 +1337,31 @@ async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
     )
 
     status = await _verify_payment_famapp(order_id, final_price, expected_user_id=user.id)
+    logger.info(
+        "Automatic payment validation completed order_id=%s user_id=%s result=%s",
+        order_id,
+        user.id,
+        status,
+    )
 
     if status == "success":
         order = await get_order(order_id)
         marked_pending = bool(order and order.get("user_id") == user.id)
         if marked_pending:
             marked_pending = await update_order_status(order_id, "pending")
+        logger.info(
+            "Automatic payment state transition order_id=%s user_id=%s marked_pending=%s",
+            order_id,
+            user.id,
+            marked_pending,
+        )
         result = await approve_order(order_id, expected_user_id=user.id) if marked_pending else None
+        logger.info(
+            "Automatic payment approval completed order_id=%s user_id=%s approved=%s",
+            order_id,
+            user.id,
+            bool(result),
+        )
         _awaiting_proof.pop(user.id, None)
 
         if result:
@@ -1456,6 +1517,7 @@ async def callback_upload_proof(call: CallbackQuery) -> None:
     await call.answer()
     order_id = call.data.split(":", 1)[1]
     _waiting_proof[call.from_user.id] = order_id
+    logger.info("Manual proof requested user_id=%s order_id=%s", call.from_user.id, order_id)
     await call.message.answer(
         "📤 <b>Upload Payment Screenshot</b>\n\n"
         "Please send your payment screenshot as a <b>photo</b>.\n\n"
@@ -1473,21 +1535,33 @@ async def handle_proof_photo(message: Message, bot: Bot) -> None:
     user = message.from_user
     order_id = _waiting_proof.pop(user.id, None)
     if not order_id:
+        logger.warning("Manual proof rejected user_id=%s reason=no_waiting_order", user.id)
         return
+    logger.info("Manual proof received user_id=%s order_id=%s", user.id, order_id)
 
     # Fetch order details from DB
     order = await get_order(order_id)
     if not order:
+        logger.warning("Manual proof rejected user_id=%s order_id=%s reason=order_not_found", user.id, order_id)
         await message.answer("⚠️ Order not found. Please contact support.")
         return
     if order.get("user_id") != user.id or order.get("payment_status") == "expired":
+        logger.warning(
+            "Manual proof rejected user_id=%s order_id=%s reason=ownership_or_expiry order_user_id=%s status=%s",
+            user.id,
+            order_id,
+            order.get("user_id"),
+            order.get("payment_status"),
+        )
         await message.answer("⚠️ This payment order has expired. Please start a new payment.")
         return
 
     # Mark order as pending (awaiting manual review)
     if not await update_order_status(order_id, "pending"):
+        logger.warning("Manual proof rejected user_id=%s order_id=%s reason=pending_transition_failed", user.id, order_id)
         await message.answer("⚠️ This payment order is no longer available. Please start a new payment.")
         return
+    logger.info("Manual proof saved for review user_id=%s order_id=%s status=pending", user.id, order_id)
 
     # Build review caption
     uname  = f"@{html.escape(user.username)}" if user.username else "—"
@@ -1512,6 +1586,8 @@ async def handle_proof_photo(message: Message, bot: Bot) -> None:
         )
     except Exception:
         logger.exception("Failed to forward proof to review channel for order %s", order_id)
+    else:
+        logger.info("Manual proof review created user_id=%s order_id=%s", user.id, order_id)
 
     # Confirm receipt to user
     await message.answer(
@@ -1550,7 +1626,18 @@ async def callback_manual_approve(call: CallbackQuery, bot: Bot) -> None:
 
     # approve_order requires pending status (already set when screenshot was received)
     result = await approve_order(order_id, expected_user_id=user_id)
+    logger.info(
+        "Manual payment approval completed order_id=%s user_id=%s approved=%s",
+        order_id,
+        user_id,
+        bool(result),
+    )
     if not result:
+        logger.warning(
+            "Manual payment approval rejected order_id=%s user_id=%s reason=approval_validation_failed",
+            order_id,
+            user_id,
+        )
         try:
             await call.message.edit_caption(
                 (call.message.caption or "") + "\n\n⚠️ Already processed.",

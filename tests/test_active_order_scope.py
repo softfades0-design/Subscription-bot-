@@ -1,6 +1,7 @@
 import asyncio
 import os
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -31,7 +32,7 @@ class ActiveOrderScopeTests(unittest.TestCase):
         class DummyMessage:
             def __init__(self):
                 self.chat = SimpleNamespace(id=123)
-                self.answer = AsyncMock(return_value=SimpleNamespace(message_id=99))
+                self.answer = AsyncMock(return_value=SimpleNamespace(message_id=99, delete=AsyncMock()))
                 self.delete = AsyncMock()
                 self.edit_text = AsyncMock()
                 self.edit_reply_markup = AsyncMock()
@@ -66,6 +67,52 @@ class ActiveOrderScopeTests(unittest.TestCase):
             send_screen.assert_awaited_once()
 
         asyncio.run(run_test())
+
+    def test_pending_transition_accepts_naive_mongo_expiry_as_utc(self):
+        orders = AsyncMock()
+        orders.find_one = AsyncMock(return_value={
+            "payment_status": "created",
+            "expires_at": datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=5),
+        })
+        orders.update_one = AsyncMock(return_value=SimpleNamespace(modified_count=1))
+
+        async def transition():
+            with patch.object(database, "_orders", orders):
+                return await database.update_order_status("ORD-NAIVE-EXPIRY", "pending")
+
+        self.assertTrue(asyncio.run(transition()))
+        self.assertEqual(
+            orders.update_one.await_args.args[0],
+            {"_id": "ORD-NAIVE-EXPIRY", "payment_status": "created"},
+        )
+
+    def test_approval_accepts_pending_order_with_naive_mongo_expiry(self):
+        order = {
+            "_id": "ORD-APPROVE-NAIVE",
+            "user_id": 7,
+            "plan_name": "Gold",
+            "plan_validity": "30 days",
+            "access_link": "https://example.com/access",
+            "payment_status": "pending",
+            "expires_at": datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=5),
+            "referral_discount_used": 0,
+        }
+        orders = AsyncMock()
+        orders.find_one = AsyncMock(return_value=order)
+        orders.find_one_and_update = AsyncMock(return_value=order)
+
+        async def approve():
+            with (
+                patch.object(database, "_orders", orders),
+                patch.object(database, "cancel_reminder", AsyncMock()),
+                patch.object(database, "consume_referral_discount", AsyncMock()),
+            ):
+                return await database.approve_order(order["_id"], expected_user_id=7)
+
+        result = asyncio.run(approve())
+        self.assertIsNotNone(result)
+        self.assertEqual(result["user_id"], 7)
+        self.assertEqual(orders.find_one_and_update.await_args.args[0]["user_id"], 7)
 
 
 if __name__ == "__main__":

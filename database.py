@@ -49,6 +49,22 @@ _reminders = _db["reminders"]
 _demo_sessions = _db["demo_sessions"]
 
 
+def _as_utc_datetime(value: datetime | str | None) -> datetime | None:
+    """Normalize MongoDB/legacy expiry values before Python comparisons."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 # ── Settings defaults (seeded once; admin can change via /admin → Settings) ───
 
 _DEFAULT_WELCOME = (
@@ -863,11 +879,17 @@ async def update_order_status(order_id: str, status: str) -> bool:
         if old_status not in {"created", "pending"}:
             return False
     elif status == "pending":
-        expires_at = current.get("expires_at")
+        expires_at = _as_utc_datetime(current.get("expires_at"))
         if expires_at and datetime.now(timezone.utc) >= expires_at:
             await _orders.update_one(
                 {"_id": order_id, "payment_status": {"$in": ["created", "pending"]}},
                 {"$set": {"payment_status": "expired"}},
+            )
+            logger.warning(
+                "Order %s rejected pending transition: expired_at=%s status=%s",
+                order_id,
+                expires_at.isoformat(),
+                current.get("payment_status"),
             )
             return False
     elif old_status not in {"created", "pending"}:
