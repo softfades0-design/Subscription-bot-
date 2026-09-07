@@ -65,6 +65,7 @@ from database import (
     clear_plan_interest,
     cancel_start_reminders,
     update_order_messages,
+    update_order_status_message,
 )
 from keyboards.menu import (
     payment_details_keyboard,
@@ -90,8 +91,50 @@ _waiting_proof: dict[int, str] = {}
 
 # (user_id, plan_id) -> lock for an in-progress Buy Now flow
 _payment_generation_locks: dict[tuple[int, int], asyncio.Lock] = {}
+_payment_status_locks: dict[tuple[int, str], asyncio.Lock] = {}
 
 _PRODUCT_TEXT = "Hello, {first_name} 👋\n\nChoose a plan to get started 💫"
+
+
+async def _edit_or_create_status_message(
+    call: CallbackQuery,
+    bot: Bot,
+    user_id: int,
+    order_id: str,
+    info: dict,
+    text: str,
+    reply_markup=None,
+):
+    """Update one verification message, recreating it only when unavailable."""
+    chat_id = call.message.chat.id
+    status_message_id = info.get("status_message_id")
+    if status_message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=status_message_id,
+                text=text,
+                reply_markup=reply_markup,
+            )
+            return status_message_id
+        except Exception as exc:
+            logger.info(
+                "Payment status message unavailable order_id=%s message_id=%s exception_type=%s",
+                order_id,
+                status_message_id,
+                type(exc).__name__,
+            )
+
+    status_message = await call.message.answer(text, reply_markup=reply_markup)
+    status_message_id = status_message.message_id
+    info["status_message_id"] = status_message_id
+    await update_order_status_message(order_id, user_id, status_message_id)
+    logger.info(
+        "Payment status message created order_id=%s message_id=%s",
+        order_id,
+        status_message_id,
+    )
+    return status_message_id
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1322,6 +1365,7 @@ async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
                 or order_doc.get("plan_price", "0"),
                 "plan_validity": order_doc.get("plan_validity", ""),
                 "access_link": order_doc.get("access_link", ""),
+                "status_message_id": order_doc.get("status_message_id"),
             }
         else:
             info = {"order_id": order_id}
@@ -1331,163 +1375,205 @@ async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
         info.get("final_price") or await get_order_final_price(order_id) or "0"
     )
 
-    # Show a "verifying" message while the API call is in-flight
-    verifying_msg = await call.message.answer(
-        "⏳ <b>Verifying your payment...</b>\n\nPlease wait a moment."
-    )
-
-    status = await _verify_payment_famapp(order_id, final_price, expected_user_id=user.id)
-    logger.info(
-        "Automatic payment validation completed order_id=%s user_id=%s result=%s",
-        order_id,
-        user.id,
-        status,
-    )
-
-    if status == "success":
-        order = await get_order(order_id)
-        marked_pending = bool(order and order.get("user_id") == user.id)
-        if marked_pending:
-            marked_pending = await update_order_status(order_id, "pending")
+    lock_key = (user.id, order_id)
+    status_lock = _payment_status_locks.setdefault(lock_key, asyncio.Lock())
+    if status_lock.locked():
         logger.info(
-            "Automatic payment state transition order_id=%s user_id=%s marked_pending=%s",
+            "Payment status check queued order_id=%s user_id=%s",
             order_id,
             user.id,
-            marked_pending,
         )
-        result = await approve_order(order_id, expected_user_id=user.id) if marked_pending else None
+    await status_lock.acquire()
+    try:
+        if not info.get("status_message_id"):
+            latest_order = await get_order(order_id)
+            if latest_order and latest_order.get("status_message_id"):
+                info["status_message_id"] = latest_order["status_message_id"]
+
+        # Show one "verifying" message while the API call is in-flight.
+        await _edit_or_create_status_message(
+            call,
+            bot,
+            user.id,
+            order_id,
+            info,
+            "⏳ <b>Verifying your payment...</b>\n\nPlease wait a moment.",
+        )
+
+        status = await _verify_payment_famapp(order_id, final_price, expected_user_id=user.id)
         logger.info(
-            "Automatic payment approval completed order_id=%s user_id=%s approved=%s",
+            "Automatic payment validation completed order_id=%s user_id=%s result=%s",
             order_id,
             user.id,
-            bool(result),
+            status,
         )
-        _awaiting_proof.pop(user.id, None)
 
-        if result:
-            sub_end_ist = result["subscription_end"].astimezone(_IST)
-            expiry_str = sub_end_ist.strftime("%d %b %Y")
-            access_link = result.get("access_link", "")
-
-            activation_text = (
-                "🎉 <b>Payment Verified! Plan Activated!</b>\n\n"
-                f"📦 <b>Plan:</b> {html.escape(result['plan_name'])}\n"
-                f"⏳ <b>Validity:</b> {html.escape(result['plan_validity'])}\n"
-                f"📅 <b>Expires:</b> {expiry_str}\n\n"
+        if status == "success":
+            order = await get_order(order_id)
+            marked_pending = bool(order and order.get("user_id") == user.id)
+            if marked_pending:
+                marked_pending = await update_order_status(order_id, "pending")
+            logger.info(
+                "Automatic payment state transition order_id=%s user_id=%s marked_pending=%s",
+                order_id,
+                user.id,
+                marked_pending,
             )
-            if access_link:
-                activation_text += f"🔗 <b>Access Link:</b>\n{access_link}\n\n"
-            activation_text += "Thank you for your purchase! ❤️"
+            result = await approve_order(order_id, expected_user_id=user.id) if marked_pending else None
+            logger.info(
+                "Automatic payment approval completed order_id=%s user_id=%s approved=%s",
+                order_id,
+                user.id,
+                bool(result),
+            )
+            _awaiting_proof.pop(user.id, None)
 
-            await log_payment_success(
+            if result:
+                sub_end_ist = result["subscription_end"].astimezone(_IST)
+                expiry_str = sub_end_ist.strftime("%d %b %Y")
+                access_link = result.get("access_link", "")
+
+                activation_text = (
+                    "🎉 <b>Payment Verified! Plan Activated!</b>\n\n"
+                    f"📦 <b>Plan:</b> {html.escape(result['plan_name'])}\n"
+                    f"⏳ <b>Validity:</b> {html.escape(result['plan_validity'])}\n"
+                    f"📅 <b>Expires:</b> {expiry_str}\n\n"
+                )
+                if access_link:
+                    activation_text += f"🔗 <b>Access Link:</b>\n{access_link}\n\n"
+                activation_text += "Thank you for your purchase! ❤️"
+
+                await log_payment_success(
+                    bot,
+                    user_id=user.id,
+                    first_name=user.first_name,
+                    plan_name=result["plan_name"],
+                    amount=final_price,
+                    order_id=order_id,
+                )
+                await _edit_or_create_status_message(
+                    call,
+                    bot,
+                    user.id,
+                    order_id,
+                    info,
+                    activation_text,
+                    main_menu_keyboard(),
+                )
+            else:
+                # Order may have already been approved (e.g. double-tap).
+                await _edit_or_create_status_message(
+                    call,
+                    bot,
+                    user.id,
+                    order_id,
+                    info,
+                    "✅ <b>Your plan is already activated.</b>\n\n"
+                    "Use /status to check your subscription.",
+                    main_menu_keyboard(),
+                )
+
+        elif status == "pending":
+            await _edit_or_create_status_message(
+                call,
+                bot,
+                user.id,
+                order_id,
+                info,
+                "⏳ Payment not received yet. Please wait a moment.\n\n"
+                "💡 If you have already paid, please contact support.",
+                payment_details_keyboard(order_id),
+            )
+        elif status == "expired":
+            await update_order_status(order_id, "expired")
+            await _edit_or_create_status_message(
+                call,
+                bot,
+                user.id,
+                order_id,
+                info,
+                "⌛ <b>This payment session has expired.</b>\n\n"
+                "Please tap <b>Buy Now</b> to generate a fresh payment QR.",
+            )
+
+        else:
+            # failed or API error — show note, delete old messages, issue a fresh order
+            await log_payment_failed(
                 bot,
                 user_id=user.id,
                 first_name=user.first_name,
-                plan_name=result["plan_name"],
+                plan_name=info.get("plan_name", ""),
                 amount=final_price,
                 order_id=order_id,
-            )
-            try:
-                await verifying_msg.delete()
-            except Exception:
-                pass
-            await call.message.answer(
-                activation_text, reply_markup=main_menu_keyboard()
-            )
-        else:
-            # Order may have already been approved (e.g. double-tap)
-            await verifying_msg.edit_text(
-                "✅ <b>Your plan is already activated.</b>\n\n"
-                "Use /status to check your subscription.",
-                reply_markup=main_menu_keyboard(),
+                reason=status,
             )
 
-    elif status == "pending":
-        await verifying_msg.edit_text(
-            "⏳ Payment not received yet. Please wait a moment and try again.",
-            reply_markup=payment_details_keyboard(order_id),
-        )
+            chat_id = call.message.chat.id
 
-    elif status == "expired":
-        await update_order_status(order_id, "expired")
-        await verifying_msg.edit_text(
-            "⌛ <b>This payment session has expired.</b>\n\n"
-            "Please tap <b>Buy Now</b> to generate a fresh payment QR."
-        )
+            # 1. Show the note by editing the status message in place.
+            note_text = (
+                "❌ <b>Payment not detected.</b>\n\n"
+                "A fresh payment QR has been generated.\n\n"
+                "💡 Please pay only using the new QR below.\n"
+                "Do not use the previous QR because it will no longer be verified."
+            )
+            await _edit_or_create_status_message(
+                call,
+                bot,
+                user.id,
+                order_id,
+                info,
+                note_text,
+            )
 
-    else:
-        # failed or API error — show note, delete old messages, issue a fresh order
-        await log_payment_failed(
-            bot,
-            user_id=user.id,
-            first_name=user.first_name,
-            plan_name=info.get("plan_name", ""),
-            amount=final_price,
-            order_id=order_id,
-            reason=status,
-        )
+            # 2. Delete the old QR photo (message sent just before the payment message)
+            qr_msg_id = info.get("qr_msg_id")
+            if qr_msg_id:
+                try:
+                    await bot.delete_message(chat_id, qr_msg_id)
+                except Exception:
+                    pass
 
-        chat_id = call.message.chat.id
-
-        # 1. Show the note by editing the "verifying…" message in place
-        note_text = (
-            "❌ <b>Payment not detected.</b>\n\n"
-            "A fresh payment QR has been generated.\n\n"
-            "💡 Please pay only using the new QR below.\n"
-            "Do not use the previous QR because it will no longer be verified."
-        )
-        try:
-            await verifying_msg.edit_text(note_text)
-        except Exception:
+            # 3. Delete the old payment details message (call.message IS that message)
             try:
-                await bot.send_message(chat_id, note_text)
+                await call.message.delete()
             except Exception:
-                pass
+                try:
+                    await call.message.edit_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
 
-        # 2. Delete the old QR photo (message sent just before the payment message)
-        qr_msg_id = info.get("qr_msg_id")
-        if qr_msg_id:
+            # Mark old order as failed and cancel its reminder
             try:
-                await bot.delete_message(chat_id, qr_msg_id)
+                await update_order_status(order_id, "expired" if status == "expired" else "failed")
             except Exception:
-                pass
-
-        # 3. Delete the old payment details message (call.message IS that message)
-        try:
-            await call.message.delete()
-        except Exception:
+                logger.exception("Failed to mark old order %s as failed", order_id)
             try:
-                await call.message.edit_reply_markup(reply_markup=None)
+                await cancel_reminder(user.id, order_id)
             except Exception:
-                pass
+                logger.exception("Failed to cancel reminder for order %s", order_id)
 
-        # Mark old order as failed and cancel its reminder
-        try:
-            await update_order_status(order_id, "expired" if status == "expired" else "failed")
-        except Exception:
-            logger.exception("Failed to mark old order %s as failed", order_id)
-        try:
-            await cancel_reminder(user.id, order_id)
-        except Exception:
-            logger.exception("Failed to cancel reminder for order %s", order_id)
-
-        # 4. Re-issue the payment screen (new order ID + fresh QR, same plan/price/layout)
-        plan_dict = {
-            "name": info.get("plan_name", ""),
-            "price": info.get("plan_price", ""),
-            "validity": info.get("plan_validity", ""),
-            "access_link": info.get("access_link", ""),
-        }
-        await _send_payment_screen(
-            bot=bot,
-            chat_id=chat_id,
-            user_id=user.id,
-            plan=plan_dict,
-            plan_id=info.get("plan_id"),
-            final_price_str=final_price,
-            price_section=info.get("price_section", ""),
-            discount_pct=info.get("discount_pct", 0),
-        )
+            # 4. Re-issue the payment screen (new order ID + fresh QR, same plan/price/layout)
+            plan_dict = {
+                "name": info.get("plan_name", ""),
+                "price": info.get("plan_price", ""),
+                "validity": info.get("plan_validity", ""),
+                "access_link": info.get("access_link", ""),
+            }
+            await _send_payment_screen(
+                bot=bot,
+                chat_id=chat_id,
+                user_id=user.id,
+                plan=plan_dict,
+                plan_id=info.get("plan_id"),
+                final_price_str=final_price,
+                price_section=info.get("price_section", ""),
+                discount_pct=info.get("discount_pct", 0),
+            )
+    finally:
+        status_lock.release()
+        if _payment_status_locks.get(lock_key) is status_lock:
+            _payment_status_locks.pop(lock_key, None)
 
 
 # ── Cancel Order (from payment details screen) ────────────────────────────────

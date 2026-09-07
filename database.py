@@ -590,6 +590,39 @@ async def get_all_user_ids() -> list[int]:
     return [doc["_id"] async for doc in cursor]
 
 
+async def get_all_users() -> list[dict]:
+    """Return registered users for the admin information view."""
+    cursor = _users.find(
+        {},
+        {"_id": 1, "username": 1, "first_name": 1, "joined_at": 1},
+    ).sort("joined_at", -1)
+    return [
+        {
+            "user_id": doc["_id"],
+            "username": doc.get("username"),
+            "first_name": doc.get("first_name") or "User",
+            "joined_at": doc.get("joined_at"),
+        }
+        async for doc in cursor
+    ]
+
+
+async def get_user_info(user_id: int) -> dict | None:
+    """Return the current stored profile fields for one user."""
+    doc = await _users.find_one(
+        {"_id": user_id},
+        {"_id": 1, "username": 1, "first_name": 1, "joined_at": 1},
+    )
+    if not doc:
+        return None
+    return {
+        "user_id": doc["_id"],
+        "username": doc.get("username"),
+        "first_name": doc.get("first_name") or "User",
+        "joined_at": doc.get("joined_at"),
+    }
+
+
 async def get_user_referral_info(user_id: int) -> dict:
     """Return referral stats for a user: total_referrals and referral_discount."""
     doc = await _users.find_one(
@@ -946,6 +979,17 @@ async def update_order_messages(
     )
 
 
+async def update_order_status_message(
+    order_id: str,
+    user_id: int,
+    status_message_id: int,
+) -> None:
+    await _orders.update_one(
+        {"_id": order_id, "user_id": user_id},
+        {"$set": {"status_message_id": status_message_id}},
+    )
+
+
 async def get_active_order_for_user_plan(user_id: int, plan_id: int | None) -> dict | None:
     """Return a non-expired in-progress order for this exact user and plan."""
     return await _orders.find_one(
@@ -976,6 +1020,7 @@ async def get_active_order_for_user_plan(user_id: int, plan_id: int | None) -> d
             "expires_at": 1,
             "qr_message_id": 1,
             "payment_message_id": 1,
+            "status_message_id": 1,
             "referral_discount_used": 1,
         },
     )
@@ -1087,6 +1132,7 @@ async def get_order(order_id: str) -> dict | None:
         "payment_purpose": doc.get("payment_purpose"),
         "upi_uri":         doc.get("upi_uri"),
         "expires_at":       doc.get("expires_at"),
+        "status_message_id": doc.get("status_message_id"),
     }
 
 

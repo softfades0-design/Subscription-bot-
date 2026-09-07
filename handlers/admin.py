@@ -35,6 +35,8 @@ from database import (
     get_stats,
     get_pending_orders,
     get_all_user_ids,
+    get_all_users,
+    get_user_info,
     get_setting,
     set_setting,
     get_start_demo,
@@ -63,6 +65,8 @@ from keyboards.menu import (
     referral_settings_keyboard,
     referral_reset_confirm_keyboard,
     payment_settings_keyboard,
+    admin_users_keyboard,
+    admin_user_details_keyboard,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,6 +100,19 @@ EDIT_FIELD_LABELS = {
 
 def _is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+def _user_contact_link(user: dict) -> str:
+    """Render the stored user name as a safe Telegram contact link."""
+    user_id = user["user_id"]
+    name = html.escape(str(user.get("first_name") or "User"))
+    username = str(user.get("username") or "").strip().lstrip("@")
+    href = f"https://t.me/{username}" if username else f"tg://user?id={user_id}"
+    return f'<a href="{html.escape(href, quote=True)}">{name}</a>'
+
+
+def _format_joined_at(value) -> str:
+    return value.isoformat() if value else "—"
 
 
 def _in_state(step: str):
@@ -200,6 +217,73 @@ async def cb_stats(call: CallbackQuery) -> None:
         f"✖️  <b>Rejected Orders</b>          {s['rejected_orders']}\n"
         "━━━━━━━━━━━━━━━━━━━━━",
         reply_markup=admin_panel_keyboard(),
+    )
+
+
+async def _show_users_page(call: CallbackQuery, page: int) -> None:
+    users = await get_all_users()
+    page_size = 8
+    total_pages = max(1, (len(users) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    page_users = users[page * page_size:(page + 1) * page_size]
+    lines = [
+        f"👥 <b>Users Info</b> <i>({page + 1}/{total_pages})</i>",
+        f"Total Users: {len(users)}\n",
+    ]
+    for user in page_users:
+        lines.append(
+            f"👤 {_user_contact_link(user)}\n"
+            f"   🆔 <code>{user['user_id']}</code>"
+        )
+    if not page_users:
+        lines.append("No users found.")
+    await call.message.edit_text(
+        "\n\n".join(lines),
+        reply_markup=admin_users_keyboard(users, page, page_size),
+    )
+
+
+@router.callback_query(lambda c: c.data == "admin_users" or (c.data and c.data.startswith("admin_users:")))
+async def cb_users_info(call: CallbackQuery) -> None:
+    if not _is_admin(call.from_user.id):
+        await call.answer("⛔ Unauthorised.", show_alert=True)
+        return
+    await call.answer()
+    try:
+        page = int(call.data.split(":", 1)[1]) if ":" in call.data else 0
+    except ValueError:
+        page = 0
+    await _show_users_page(call, page)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("admin_user:"))
+async def cb_user_details(call: CallbackQuery) -> None:
+    if not _is_admin(call.from_user.id):
+        await call.answer("⛔ Unauthorised.", show_alert=True)
+        return
+    await call.answer()
+    try:
+        _, user_id_text, page_text = call.data.split(":", 2)
+        user_id = int(user_id_text)
+        page = int(page_text)
+    except (ValueError, IndexError):
+        await call.answer("⚠️ Invalid user.", show_alert=True)
+        return
+    user = await get_user_info(user_id)
+    if not user:
+        await call.message.edit_text(
+            "⚠️ User not found.",
+            reply_markup=admin_user_details_keyboard(page),
+        )
+        return
+    username = user.get("username")
+    username_line = f"@{html.escape(str(username))}" if username else "—"
+    await call.message.edit_text(
+        f"👤 {_user_contact_link(user)}\n"
+        f"🆔 <code>{user['user_id']}</code>\n"
+        f"📛 Username: {username_line}\n"
+        f"📅 Joined: {_format_joined_at(user.get('joined_at'))}",
+        reply_markup=admin_user_details_keyboard(page),
     )
 
 

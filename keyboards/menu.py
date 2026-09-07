@@ -54,6 +54,9 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📢 Broadcast",  callback_data="admin_broadcast"),
             ],
             [
+                InlineKeyboardButton(text="👥 Users Info", callback_data="admin_users"),
+            ],
+            [
                 InlineKeyboardButton(text="📢 Premium Subscribers", callback_data="admin_premium_subscribers"),
             ],
             [
@@ -109,6 +112,35 @@ def premium_subscribers_preview_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="✅ Send", callback_data="admin_ps_send"),
                 InlineKeyboardButton(text="❌ Cancel", callback_data="admin_ps_cancel"),
             ],
+        ]
+    )
+
+
+def admin_users_keyboard(users: list[dict], page: int, page_size: int = 8) -> InlineKeyboardMarkup:
+    total_pages = max(1, (len(users) + page_size - 1) // page_size)
+    rows = [
+        [InlineKeyboardButton(
+            text=f"👤 {user.get('first_name') or 'User'}",
+            callback_data=f"admin_user:{user['user_id']}:{page}",
+        )]
+        for user in users[page * page_size:(page + 1) * page_size]
+    ]
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(text="⬅️ Previous", callback_data=f"admin_users:{page - 1}"))
+    if page + 1 < total_pages:
+        navigation.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin_users:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="admin_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_user_details_keyboard(page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Back to Users", callback_data=f"admin_users:{page}")],
+            [InlineKeyboardButton(text="❌ Close", callback_data="admin_cancel")],
         ]
     )
 

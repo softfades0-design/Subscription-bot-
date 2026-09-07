@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from io import BytesIO
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import zxingcpp
@@ -141,6 +142,48 @@ class FamAppQrTests(unittest.TestCase):
         update_status.assert_awaited_once_with(order["order_id"], "pending")
         bot.send_photo.assert_awaited_once()
         message.answer.assert_awaited_once()
+
+    def test_payment_status_message_is_reused_on_repeated_update(self):
+        call = SimpleNamespace(
+            message=SimpleNamespace(
+                chat=SimpleNamespace(id=7),
+                answer=AsyncMock(return_value=SimpleNamespace(message_id=101)),
+            )
+        )
+        bot = AsyncMock()
+        info = {}
+
+        async def update_status_message():
+            with patch.object(payment, "update_order_status_message", new=AsyncMock()) as save_status:
+                first_id = await payment._edit_or_create_status_message(
+                    call,
+                    bot,
+                    7,
+                    "ORD-STATUS-1",
+                    info,
+                    "first",
+                )
+                second_id = await payment._edit_or_create_status_message(
+                    call,
+                    bot,
+                    7,
+                    "ORD-STATUS-1",
+                    info,
+                    "second",
+                )
+            return first_id, second_id, save_status
+
+        first_id, second_id, save_status = asyncio.run(update_status_message())
+        self.assertEqual(first_id, 101)
+        self.assertEqual(second_id, 101)
+        call.message.answer.assert_awaited_once()
+        bot.edit_message_text.assert_awaited_once_with(
+            chat_id=7,
+            message_id=101,
+            text="second",
+            reply_markup=None,
+        )
+        save_status.assert_awaited_once_with("ORD-STATUS-1", 7, 101)
 
     def test_generated_purpose_flows_through_qr_and_verification(self):
         amount = "1.00"
