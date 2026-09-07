@@ -116,30 +116,20 @@ def premium_subscribers_preview_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def admin_users_keyboard(users: list[dict], page: int, page_size: int = 8) -> InlineKeyboardMarkup:
-    total_pages = max(1, (len(users) + page_size - 1) // page_size)
-    rows = [
-        [InlineKeyboardButton(
-            text=f"👤 {user.get('first_name') or 'User'}",
-            callback_data=f"admin_user:{user['user_id']}:{page}",
-        )]
-        for user in users[page * page_size:(page + 1) * page_size]
-    ]
-    navigation = []
-    if page > 0:
-        navigation.append(InlineKeyboardButton(text="⬅️ Previous", callback_data=f"admin_users:{page - 1}"))
-    if page + 1 < total_pages:
-        navigation.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin_users:{page + 1}"))
-    if navigation:
-        rows.append(navigation)
-    rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="admin_cancel")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def admin_user_details_keyboard(page: int) -> InlineKeyboardMarkup:
+def admin_users_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Back to Users", callback_data=f"admin_users:{page}")],
+            [InlineKeyboardButton(text="🔎 Search User", callback_data="admin_users_search")],
+            [InlineKeyboardButton(text="⬅️ Back", callback_data="admin_cancel")],
+        ]
+    )
+
+
+def admin_user_details_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔎 Search Another User", callback_data="admin_users_search")],
+            [InlineKeyboardButton(text="⬅️ Back to Users", callback_data="admin_users")],
             [InlineKeyboardButton(text="❌ Close", callback_data="admin_cancel")],
         ]
     )

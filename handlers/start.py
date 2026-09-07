@@ -265,6 +265,7 @@ async def callback_plan(call: CallbackQuery, bot: Bot) -> None:
         call.from_user.first_name,
         plan_title=plan["name"],
         price=f"₹{plan['price']} / {plan['validity']}",
+        username=call.from_user.username,
     )
 
     demo_result = await send_demo_videos(bot, call.message.chat.id, call.from_user.id, plan)

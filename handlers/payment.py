@@ -75,7 +75,12 @@ from keyboards.menu import (
     plans_list_keyboard,
     payment_retry_keyboard,
 )
-from handlers.log_channel import log_payment_started, log_payment_success, log_payment_failed
+from handlers.log_channel import (
+    log_payment_started,
+    log_payment_success,
+    log_payment_failed,
+    log_payment_cancelled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1254,7 +1259,13 @@ async def callback_buy(
             logger.info("BUY CALLBACK RETURN: subscription already active user_id=%s plan_id=%s", user.id, plan_id)
             return
 
-        await log_payment_started(bot, user.id, user.first_name, plan_title=plan["name"])
+        await log_payment_started(
+            bot,
+            user.id,
+            user.first_name,
+            plan_title=plan["name"],
+            username=getattr(user, "username", None),
+        )
 
         # User clicked Buy Now — suppress any pending plan-interest reminder.
         try:
@@ -1450,6 +1461,7 @@ async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
                     plan_name=result["plan_name"],
                     amount=final_price,
                     order_id=order_id,
+                    username=getattr(user, "username", None),
                 )
                 await _edit_or_create_status_message(
                     call,
@@ -1506,6 +1518,7 @@ async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
                 amount=final_price,
                 order_id=order_id,
                 reason=status,
+                username=getattr(user, "username", None),
             )
 
             chat_id = call.message.chat.id
@@ -1580,10 +1593,18 @@ async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("cancel_order:"))
-async def callback_cancel_order(call: CallbackQuery) -> None:
+async def callback_cancel_order(call: CallbackQuery, bot: Bot) -> None:
     await call.answer()
     order_id = call.data.split(":", 1)[1]
-    await update_order_status(order_id, "cancelled")
+    cancelled = await update_order_status(order_id, "cancelled")
+    if cancelled:
+        await log_payment_cancelled(
+            bot=bot,
+            user_id=call.from_user.id,
+            first_name=call.from_user.first_name,
+            order_id=order_id,
+            username=getattr(call.from_user, "username", None),
+        )
     _awaiting_proof.pop(call.from_user.id, None)
     await cancel_reminder(call.from_user.id, order_id)
 
@@ -1770,6 +1791,7 @@ async def callback_manual_approve(call: CallbackQuery, bot: Bot) -> None:
             plan_name=result["plan_name"],
             amount=amount,
             order_id=order_id,
+            username=getattr(chat, "username", None) if "chat" in locals() else None,
         )
     except Exception:
         logger.exception("Failed to log manual approval for order %s", order_id)

@@ -41,6 +41,7 @@ from database import (
     claim_demo_expiry,
     complete_demo_deletion,
     expire_due_orders,
+    get_user_info,
     cancel_reminder,
 )
 from keyboards.menu import (
@@ -50,6 +51,7 @@ from keyboards.menu import (
     regenerate_payment_qr_keyboard,
 )
 from keyboards.menu import plans_list_keyboard
+from handlers.log_channel import log_payment_expired
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +111,14 @@ async def _tick(bot: Bot) -> None:
     # update is atomic, so an approval racing this sweep cannot win afterward.
     for order in await expire_due_orders():
         await cancel_reminder(order["user_id"], order["_id"])
+        user = await get_user_info(order["user_id"])
+        await log_payment_expired(
+            bot,
+            user_id=order["user_id"],
+            first_name=(user or {}).get("first_name", "User"),
+            order_id=order["_id"],
+            username=(user or {}).get("username"),
+        )
         for message_id in (order.get("qr_message_id"), order.get("payment_message_id")):
             if not message_id:
                 continue

@@ -1,6 +1,7 @@
 import asyncio
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("BOT_TOKEN", "test-token")
@@ -8,6 +9,7 @@ os.environ.setdefault("ADMIN_IDS", "1")
 os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017")
 
 import database  # noqa: E402
+import handlers.admin as admin  # noqa: E402
 from handlers.admin import _user_contact_link  # noqa: E402
 
 
@@ -48,6 +50,41 @@ class AdminUsersTests(unittest.TestCase):
         self.assertEqual(result["joined_at"], "joined")
         projection = users.find_one.await_args.args[1]
         self.assertNotIn("referral_discount", projection)
+
+    def test_search_returns_only_requested_user(self):
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            text="123",
+            answer=AsyncMock(),
+        )
+        user = {"user_id": 123, "first_name": "Bobby", "username": None, "joined_at": None}
+        admin._state[1] = {"step": "users:search", "data": {}}
+
+        async def search():
+            with patch.object(admin, "get_user_info", new=AsyncMock(return_value=user)):
+                await admin.handle_users_search(message)
+
+        asyncio.run(search())
+        text = message.answer.await_args.args[0]
+        self.assertIn("Bobby", text)
+        self.assertIn("123", text)
+        self.assertIn("tg://user?id=123", text)
+        self.assertNotIn("Total Users", text)
+
+    def test_search_reports_user_not_found(self):
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            text="999",
+            answer=AsyncMock(),
+        )
+        admin._state[1] = {"step": "users:search", "data": {}}
+
+        async def search():
+            with patch.object(admin, "get_user_info", new=AsyncMock(return_value=None)):
+                await admin.handle_users_search(message)
+
+        asyncio.run(search())
+        self.assertEqual(message.answer.await_args.args[0], "⚠️ User not found.")
 
 
 if __name__ == "__main__":
