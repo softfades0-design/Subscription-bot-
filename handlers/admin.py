@@ -79,7 +79,6 @@ router = Router()
 # ── State storage ─────────────────────────────────────────────────────────────
 # { user_id: { "step": str, "data": dict } }
 _state: dict[int, dict] = {}
-_payment_stats_refresh_tasks: dict[int, asyncio.Task] = {}
 
 _STEPS_LABEL = {
     "add:name":     "📝 Enter the plan name:",
@@ -131,12 +130,7 @@ def _in_any_admin_state(message: Message) -> bool:
     return message.from_user.id in _state
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _cancel_payment_stats_refresh(user_id: int) -> None:
-    task = _payment_stats_refresh_tasks.pop(user_id, None)
-    if task and not task.done():
-        task.cancel()
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 
 async def _render_payment_stats_message(message, admin_id: int) -> None:
@@ -197,11 +191,6 @@ async def _render_payment_stats_message(message, admin_id: int) -> None:
 
 async def _go_panel(target, bot: Bot | None = None) -> None:
     """Send or edit-to the main admin panel."""
-    if isinstance(target, CallbackQuery):
-        _cancel_payment_stats_refresh(target.from_user.id)
-    elif hasattr(target, "from_user") and target.from_user is not None:
-        _cancel_payment_stats_refresh(target.from_user.id)
-
     text = "🛠 <b>ADMIN PANEL</b>\n\nSelect an option:"
     kb = admin_panel_keyboard()
     if isinstance(target, CallbackQuery):
@@ -297,25 +286,7 @@ async def cb_payment_stats_24h(call: CallbackQuery) -> None:
         await call.answer("⛔ Unauthorised.", show_alert=True)
         return
     await call.answer()
-
-    _cancel_payment_stats_refresh(call.from_user.id)
     await _render_payment_stats_message(call.message, call.from_user.id)
-
-    async def _refresh_loop() -> None:
-        try:
-            while True:
-                await asyncio.sleep(15)
-                if not _is_admin(call.from_user.id):
-                    return
-                try:
-                    await _render_payment_stats_message(call.message, call.from_user.id)
-                except Exception:
-                    logger.exception("Failed to auto-refresh admin payment stats user_id=%s", call.from_user.id)
-        except asyncio.CancelledError:
-            pass
-
-    task = asyncio.create_task(_refresh_loop())
-    _payment_stats_refresh_tasks[call.from_user.id] = task
 
 
 async def _show_maintenance_panel(call: CallbackQuery) -> None:
