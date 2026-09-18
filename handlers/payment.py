@@ -1403,10 +1403,15 @@ async def create_vc_gateway_payment(
     final_price_str: str,
     price_section: str,
     discount_pct: int,
+    replacement_notice: str | None = None,
 ) -> str | None:
     """Create and render a fresh VC Gateway payment order."""
     if not VC_GATEWAY_UPI_ID:
-        await bot.send_message(chat_id, "⚠️ VC Gateway is not configured. Please contact support.")
+        await bot.send_message(
+            chat_id,
+            "⚠️ VC Gateway is not configured. Please contact support.",
+            reply_markup=payment_retry_keyboard(plan_id) if replacement_notice else None,
+        )
         return None
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=int(ORDER_EXPIRY_MINUTES or 10))
     order_id = None
@@ -1442,7 +1447,11 @@ async def create_vc_gateway_payment(
             await bot.send_message(chat_id, "⚠️ Could not create the VC Gateway payment. Please try again.")
             return None
     if not order_id or not vc_order_id or qr_bytes is None:
-        await bot.send_message(chat_id, "⚠️ Could not generate a VC Gateway order. Please try again.")
+        await bot.send_message(
+            chat_id,
+            "⚠️ Could not generate a VC Gateway order. Please try again.",
+            reply_markup=payment_retry_keyboard(plan_id) if replacement_notice else None,
+        )
         return None
 
     await supersede_active_orders(user_id, plan_id, order_id)
@@ -1461,6 +1470,8 @@ async def create_vc_gateway_payment(
             f"🆔 <b>VC Order ID:</b> <code>{vc_order_id}</code>\n"
             "⏱️ <b>Expires in:</b> 10 minutes"
         )
+        if replacement_notice:
+            await bot.send_message(chat_id, replacement_notice)
         payment_message = await bot.send_message(
             chat_id,
             payment_text,
@@ -1759,6 +1770,101 @@ async def approve_vc_gateway_order(order: dict, user_id: int, provider_summary: 
     )
 
 
+def _vc_status_requires_replacement(provider_status: str, summary: dict | None) -> bool:
+    if provider_status in {"FAILED", "INVALID", "NOT_FOUND"}:
+        return True
+    gateway_message = str((summary or {}).get("gateway_message") or "").strip().lower()
+    return (
+        provider_status == "ERROR"
+        and (summary or {}).get("status") == "FAILED"
+        and "invalid order id" in gateway_message
+    )
+
+
+async def _delete_vc_payment_messages(
+    bot: Bot,
+    chat_id: int,
+    order: dict,
+    callback_message_id: int | None = None,
+) -> None:
+    message_ids = {
+        order.get("qr_message_id"),
+        order.get("payment_message_id"),
+        callback_message_id,
+    }
+    for message_id in message_ids:
+        if not message_id:
+            continue
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception as exc:
+            logger.info(
+                "VC old payment message already unavailable order_id=%s message_id=%s exception_type=%s",
+                order.get("order_id"), message_id, type(exc).__name__,
+            )
+
+
+async def _replace_invalid_vc_payment(call: CallbackQuery, bot: Bot, order: dict, info: dict) -> None:
+    old_order_id = order["order_id"]
+    old_vc_order_id = order.get("vc_order_id")
+    logger.info(
+        "VC PAYMENT STATUS CHECK old_internal_order_id=%s old_vc_order_id=%s ACTION=INVALIDATE_AND_REPLACE",
+        old_order_id, old_vc_order_id,
+    )
+    if not await update_order_status(old_order_id, "failed"):
+        logger.info("VC replacement skipped because order is no longer live order_id=%s", old_order_id)
+        return
+
+    await _delete_vc_payment_messages(
+        bot,
+        call.message.chat.id,
+        order,
+        getattr(call.message, "message_id", None),
+    )
+    plan = await get_plan(order.get("plan_id"))
+    if not plan:
+        await bot.send_message(
+            call.message.chat.id,
+            "⚠️ Payment replacement failed. Please try again from Buy Now.",
+            reply_markup=payment_retry_keyboard(order.get("plan_id")),
+        )
+        return
+    replacement_notice = (
+        "⚠️ <b>Payment Not Detected</b>\n\n"
+        "A new payment QR has been generated.\n\n"
+        "🚫 Do NOT pay using the old QR.\n"
+        "The old QR is no longer supported and payments made through the old QR cannot be automatically verified.\n\n"
+        "💡 If you have already paid using the old QR, please contact support with your payment/order details.\n\n"
+        "👇 Please use ONLY the new QR below to make your payment."
+    )
+    try:
+        new_order_id = await create_vc_gateway_payment(
+            bot=bot,
+            chat_id=call.message.chat.id,
+            user_id=call.from_user.id,
+            plan=plan,
+            plan_id=order.get("plan_id"),
+            final_price_str=str(order.get("expected_amount")),
+            price_section=info.get("price_section", ""),
+            discount_pct=info.get("discount_pct", 0),
+            replacement_notice=replacement_notice,
+        )
+    except Exception:
+        logger.exception("VC payment replacement generation failed old_order=%s", old_order_id)
+        await bot.send_message(
+            call.message.chat.id,
+            "⚠️ New payment QR could not be generated. Please try again from Buy Now.",
+            reply_markup=payment_retry_keyboard(order.get("plan_id")),
+        )
+        return
+    if new_order_id:
+        new_order = await get_order(new_order_id)
+        logger.info(
+            "VC PAYMENT REPLACED old_order=%s new_internal_order=%s new_vc_order=%s",
+            old_order_id, new_order_id, (new_order or {}).get("vc_order_id"),
+        )
+
+
 @router.callback_query(lambda c: c.data and c.data.startswith("vc_check:"))
 async def callback_vc_check(call: CallbackQuery, bot: Bot) -> None:
     await call.answer()
@@ -1834,6 +1940,13 @@ async def callback_vc_check(call: CallbackQuery, bot: Bot) -> None:
             else:
                 logger.info("VC duplicate callback ignored order_id=%s user_id=%s", order_id, user.id)
                 await _edit_or_create_status_message(call, bot, user.id, order_id, info, "✅ <b>Your plan is already activated.</b>\n\nUse /status to check your subscription.", main_menu_keyboard())
+            return
+        logger.info(
+            "VC PAYMENT STATUS CHECK old_internal_order_id=%s old_vc_order_id=%s gateway_status=%s gateway_message=%s",
+            order_id, order.get("vc_order_id"), provider_status, (summary or {}).get("gateway_message"),
+        )
+        if _vc_status_requires_replacement(provider_status, summary):
+            await _replace_invalid_vc_payment(call, bot, order, info)
             return
         messages = {
             "PENDING": "Payment not detected yet. Please wait a moment and try again.\n\nIf you have already paid, please contact support.",

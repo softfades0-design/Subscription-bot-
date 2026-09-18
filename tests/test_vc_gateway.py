@@ -276,16 +276,17 @@ class VcGatewayTests(unittest.TestCase):
                 patch.object(payment, "save_provider_response_summary", new=AsyncMock()),
                 patch.object(payment, "approve_vc_gateway_order", new=AsyncMock()) as approve,
                 patch.object(payment, "_edit_or_create_status_message", new=AsyncMock()) as edit,
+                patch.object(payment, "_replace_invalid_vc_payment", new=AsyncMock()) as replace,
             ):
                 await payment.callback_vc_check(DummyCall(), AsyncMock())
-            return approve, edit
+            return approve, edit, replace
 
-        approve, edit = asyncio.run(run())
+        approve, edit, replace = asyncio.run(run())
         approve.assert_not_awaited()
-        self.assertIn("Payment verification is temporarily unavailable", edit.await_args_list[-1].args[5])
-        self.assertIn("ORD1", edit.await_args_list[-1].args[5])
+        edit.assert_awaited_once()
+        replace.assert_awaited_once()
 
-    def test_vc_check_pending_failed_and_unknown_keep_payment_open(self):
+    def test_vc_check_pending_and_transport_error_keep_payment_open(self):
         order = {
             "order_id": "ORD1",
             "user_id": 7,
@@ -321,9 +322,6 @@ class VcGatewayTests(unittest.TestCase):
 
         for provider_status, expected_text in (
             ("PENDING", "Payment not detected yet. Please wait a moment and try again."),
-            ("FAILED", "VC Gateway reports that this payment failed."),
-            ("INVALID", "VC Gateway returned an invalid payment response."),
-            ("NOT_FOUND", "VC Gateway could not find this payment yet."),
             ("ERROR", "Payment verification is temporarily unavailable."),
         ):
             edit, approve = asyncio.run(run(provider_status))
@@ -333,6 +331,39 @@ class VcGatewayTests(unittest.TestCase):
                 f"{provider_status}: {edit.await_args_list}",
             )
             self.assertIsNotNone(edit.await_args_list[-1].args[6])
+
+    def test_vc_definitive_failure_replaces_once(self):
+        order = {
+            "order_id": "ORD1",
+            "user_id": 7,
+            "plan_id": 3,
+            "expected_amount": "39.00",
+            "payment_provider": "vc_gateway",
+            "vc_order_id": "VC-OLD",
+            "payment_status": "created",
+            "expires_at": None,
+        }
+
+        class DummyCall:
+            data = "vc_check:ORD1"
+            from_user = SimpleNamespace(id=7, first_name="Demo")
+            message = SimpleNamespace()
+            answer = AsyncMock()
+
+        async def run(provider_status):
+            with (
+                patch.object(payment, "get_order", new=AsyncMock(return_value=order)),
+                patch.object(payment, "verify_vc_gateway_payment", new=AsyncMock(return_value=(provider_status, {"status": provider_status}))),
+                patch.object(payment, "save_provider_response_summary", new=AsyncMock()),
+                patch.object(payment, "_edit_or_create_status_message", new=AsyncMock()),
+                patch.object(payment, "_replace_invalid_vc_payment", new=AsyncMock()) as replace,
+            ):
+                await payment.callback_vc_check(DummyCall(), AsyncMock())
+            return replace
+
+        for provider_status in ("FAILED", "INVALID", "NOT_FOUND"):
+            replace = asyncio.run(run(provider_status))
+            replace.assert_awaited_once()
 
     def test_vc_success_activates_once_and_delivers_access_link(self):
         order = {
