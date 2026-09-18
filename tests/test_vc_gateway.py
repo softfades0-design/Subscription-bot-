@@ -678,6 +678,48 @@ class VcGatewayTests(unittest.TestCase):
         self.assertIn(created[0]["vc_order_id"], payment_texts[0])
         self.assertIn(created[1]["vc_order_id"], payment_texts[1])
 
+    def test_vc_replacement_warning_precedes_qr_and_payment(self):
+        bot = AsyncMock()
+        bot.send_message.side_effect = [SimpleNamespace(message_id=11), SimpleNamespace(message_id=12)]
+        bot.send_photo.return_value = SimpleNamespace(message_id=10)
+        plan = {
+            "name": "Gold",
+            "price": "199",
+            "validity": "30 days",
+            "access_link": "https://example.com/access",
+        }
+        replacement_notice = (
+            "⚠️ <b>Payment Not Detected</b>\n\n"
+            "A new payment QR has been generated.\n\n"
+            "🚫 Do NOT pay using the old QR.\n"
+            "Old QR payments are not supported.\n\n"
+            "💡 Already paid using the old QR?\n"
+            "Contact support with your payment/order details."
+        )
+
+        async def record_order(**_kwargs):
+            return None
+
+        async def run():
+            with (
+                patch.object(payment, "VC_GATEWAY_UPI_ID", "merchant@example"),
+                patch.object(payment, "create_order", new=record_order),
+                patch.object(payment, "supersede_active_orders", new=AsyncMock()),
+                patch.object(payment, "update_order_messages", new=AsyncMock()),
+                patch.object(payment, "set_pending_reminder", new=AsyncMock()),
+            ):
+                await payment.create_vc_gateway_payment(
+                    bot, 7, 7, plan, 3, "199", "Price", 0,
+                    replacement_notice=replacement_notice,
+                )
+
+        asyncio.run(run())
+        self.assertEqual(
+            [call[0] for call in bot.method_calls],
+            ["send_message", "send_photo", "send_message"],
+        )
+        self.assertEqual(bot.send_message.call_args_list[0].args[1], replacement_notice)
+
     def test_vc_payment_message_never_contains_internal_ord_id(self):
         bot = AsyncMock()
         bot.send_photo.return_value = SimpleNamespace(message_id=10)

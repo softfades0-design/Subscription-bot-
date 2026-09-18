@@ -1457,6 +1457,8 @@ async def create_vc_gateway_payment(
     await supersede_active_orders(user_id, plan_id, order_id)
     logger.info("VC order created order_id=%s vc_order_id=%s user_id=%s plan_id=%s", order_id, vc_order_id, user_id, plan_id)
     try:
+        if replacement_notice:
+            await bot.send_message(chat_id, replacement_notice)
         qr_message = await bot.send_photo(
             chat_id=chat_id,
             photo=BufferedInputFile(qr_bytes, filename=f"{vc_order_id}.png"),
@@ -1470,8 +1472,6 @@ async def create_vc_gateway_payment(
             f"🆔 <b>VC Order ID:</b> <code>{vc_order_id}</code>\n"
             "⏱️ <b>Expires in:</b> 10 minutes"
         )
-        if replacement_notice:
-            await bot.send_message(chat_id, replacement_notice)
         payment_message = await bot.send_message(
             chat_id,
             payment_text,
@@ -1833,9 +1833,9 @@ async def _replace_invalid_vc_payment(call: CallbackQuery, bot: Bot, order: dict
         "⚠️ <b>Payment Not Detected</b>\n\n"
         "A new payment QR has been generated.\n\n"
         "🚫 Do NOT pay using the old QR.\n"
-        "The old QR is no longer supported and payments made through the old QR cannot be automatically verified.\n\n"
-        "💡 If you have already paid using the old QR, please contact support with your payment/order details.\n\n"
-        "👇 Please use ONLY the new QR below to make your payment."
+        "Old QR payments are not supported.\n\n"
+        "💡 Already paid using the old QR?\n"
+        "Contact support with your payment/order details."
     )
     try:
         new_order_id = await create_vc_gateway_payment(
